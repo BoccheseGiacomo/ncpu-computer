@@ -1,0 +1,15 @@
+name: slackenv
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.5.1
+  - pytorch-cuda=12.1
+  - ipykernel>=6.29,<7
+  - jupyterlab>=4.2,<5
+  - pytest>=8,<9
+  - pip
+  - pip:
+      - -e .
