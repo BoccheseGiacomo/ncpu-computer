@@ -197,3 +197,9 @@ def test_validation_covers_core_invariants():
     assert "tape geometry" in report.checks
     assert "loss and gradients" in report.checks
     assert report.examples == len(dataset)
+
+
+def test_validation_does_not_require_task_outputs_to_differ_from_inputs():
+    config, _ = tiny_setup()
+    copy_data = TaskDataset.from_task(reverse_task(1), config.geometry.tape_slots)
+    assert validate_experiment(config, copy_data).examples == len(copy_data)

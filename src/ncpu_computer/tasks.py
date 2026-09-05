@@ -69,16 +69,33 @@ def binary_strings(max_length: int, *, include_shorter: bool = True) -> tuple[st
 
 def reverse_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
     strings = binary_strings(max_length, include_shorter=include_shorter)
+    scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
-        name=f"reverse-up-to-{max_length}",
+        name=f"reverse-{scope}",
         examples=tuple(StringExample(value, value[::-1]) for value in strings),
+    )
+
+
+def bitwise_not_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    strings = binary_strings(max_length, include_shorter=include_shorter)
+    scope = f"up-to-{max_length}" if include_shorter else str(max_length)
+    return StringTask(
+        name=f"bit-not-{scope}",
+        examples=tuple(
+            StringExample(
+                value,
+                "".join("1" if bit == "0" else "0" for bit in value),
+            )
+            for value in strings
+        ),
     )
 
 
 def parity_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
     strings = binary_strings(max_length, include_shorter=include_shorter)
+    scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
-        name=f"parity-up-to-{max_length}",
+        name=f"parity-{scope}",
         examples=tuple(
             StringExample(value, "1" if value.count("1") % 2 else "0")
             for value in strings

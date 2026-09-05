@@ -6,6 +6,7 @@ from ncpu_computer.tasks import (
     StringTask,
     TaskDataset,
     addition_task,
+    bitwise_not_task,
     parity_task,
     reverse_task,
     semantic_correct,
@@ -19,8 +20,27 @@ def test_builtin_tasks_have_exact_string_semantics():
     assert ("11B10", "101") in examples
     assert ("0B0", "0") in examples
     assert reverse_task(2).examples[-1] == StringExample("11", "11")
+    bit_not = {
+        example.input: example.target for example in bitwise_not_task(2).examples
+    }
+    assert bit_not == {
+        "0": "1",
+        "1": "0",
+        "00": "11",
+        "01": "10",
+        "10": "01",
+        "11": "00",
+    }
     parity = {example.input: example.target for example in parity_task(2).examples}
     assert parity == {"0": "0", "1": "1", "00": "0", "01": "1", "10": "1", "11": "0"}
+
+
+def test_exact_length_tasks_exclude_shorter_strings():
+    inputs = [
+        example.input for example in reverse_task(2, include_shorter=False).examples
+    ]
+    assert inputs == ["00", "01", "10", "11"]
+    assert bitwise_not_task(2, include_shorter=False).name == "bit-not-2"
 
 
 def test_task_validation_rejects_ambiguous_targets():

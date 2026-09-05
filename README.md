@@ -6,9 +6,9 @@ state over time. Inputs and outputs are strings written on a one-dimensional
 logical tape embedded in a two-dimensional grid.
 
 The immediate objective is to learn individual string transformations such as
-binary addition, reversal, and parity. The medium-term objective is to place a
-task-specific program in the initial state so that one fixed local rule can
-perform different computations when given different programs.
+binary addition, reversal, bitwise NOT, and parity. The medium-term objective
+is to place a task-specific program in the initial state so that one fixed
+local rule can perform different computations when given different programs.
 
 The repository contains the complete fixed-geometry, single-task baseline:
 ternary codecs, tape layouts, task datasets, the local NCA rule, long-window
@@ -58,6 +58,11 @@ width of 96, and zero weights for both optional structural losses. Training is
 not launched automatically by the notebook: set its explicit `RUN_TRAINING`
 switch when ready.
 
+For unary binary-string experiments, open
+`run/simple_binary_tasks.ipynb`. Its `TASK_NAME` switch selects either reversal
+or bitwise NOT. It trains on every string up to a chosen length and evaluates
+on strings of one exact longer length, preserving leading zeroes throughout.
+
 ## Repository structure
 
 ```text
@@ -69,7 +74,9 @@ src/ncpu_computer/
   training.py     objectives, optimization, checkpoints, multi-seed runs
   evaluation.py   tensorized metrics and single-example inference
   validation.py   fast checks of the experiment's core invariants
-run/run.ipynb     configured training and evaluation workflow
+run/run.ipynb     binary-addition training and evaluation workflow
+run/simple_binary_tasks.ipynb
+                  reversal/bitwise-NOT and length-extrapolation workflow
 tests/            focused CPU regression tests
 ```
 

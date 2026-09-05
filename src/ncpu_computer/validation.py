@@ -83,11 +83,13 @@ def validate_experiment(
 
     batch = dataset.take(torch.arange(min(2, len(dataset))))
     inputs, targets, _, terminator, tail = batch
+    probe_targets = targets.clone()
+    probe_targets[:, 0] = torch.where(inputs[:, 0] <= 0, 1.0, -1.0)
     train_model = NeuralCellularAutomaton(config.model)
     rollout = train_model(train_model.initial_state(layout.render_tape(inputs)), 1)
     losses = supervised_loss(
         rollout,
-        targets,
+        probe_targets,
         layout,
         config.model.io_channel,
         free_steps=0,
