@@ -53,10 +53,12 @@ trainer = Trainer(config, dataset)
 trainer.fit("checkpoints/seed_0")
 ```
 
-The defaults use 60 free steps followed by 140 supervised states, a hidden
-width of 96, and zero weights for both optional structural losses. Training is
-not launched automatically by the notebook: set its explicit `RUN_TRAINING`
-switch when ready.
+The addition notebook exposes every task, geometry, model, training,
+evaluation, and GIF setting in its first code cell. That cell validates the
+experiment and prints the physical tape layout before any optional action.
+Training is not launched automatically: set its explicit `RUN_TRAINING`
+switch when ready. The notebook default batch size is 64 so its 200-step
+backpropagation graph fits a 4 GiB GPU.
 
 For unary binary-string experiments, open
 `run/simple_binary_tasks.ipynb`. Its `TASK_NAME` switch selects either reversal
@@ -74,6 +76,7 @@ src/ncpu_computer/
   training.py     objectives, optimization, checkpoints, multi-seed runs
   evaluation.py   tensorized metrics and single-example inference
   validation.py   fast checks of the experiment's core invariants
+  visualize.py    role-aware annotated GIF rendering of NCA trajectories
 run/run.ipynb     binary-addition training and evaluation workflow
 run/simple_binary_tasks.ipynb
                   reversal/bitwise-NOT and length-extrapolation workflow

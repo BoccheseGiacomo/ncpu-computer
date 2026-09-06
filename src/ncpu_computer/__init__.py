@@ -32,6 +32,7 @@ from .training import (
     train_seeds,
 )
 from .validation import ValidationReport, validate_experiment
+from .visualize import evolution_phase, rollout_rgb, save_gif
 
 __all__ = [
     "TERNARY_THRESHOLD",
@@ -69,4 +70,7 @@ __all__ = [
     "tensor_to_symbols",
     "train_seeds",
     "validate_experiment",
+    "evolution_phase",
+    "rollout_rgb",
+    "save_gif",
 ]

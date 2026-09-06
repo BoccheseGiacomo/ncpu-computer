@@ -9,6 +9,7 @@ dependencies:
   - pytorch-cuda=12.1
   - ipykernel>=6.29,<7
   - jupyterlab>=4.2,<5
+  - pillow>=10.1,<13
   - pytest>=8,<9
   - pip
   - pip:

@@ -19,6 +19,12 @@ def test_notebooks_are_clean_and_have_explicit_training_switches():
     assert set(sources) == {"run.ipynb", "simple_binary_tasks.ipynb"}
     assert all("RUN_TRAINING = False" in source for source in sources.values())
     assert "RUN_8BIT_EVALUATION = False" in sources["run.ipynb"]
+    assert all("RUN_VISUALIZATION = False" in source for source in sources.values())
+    assert all("GeometryConfig(" in source for source in sources.values())
+    assert all("ModelConfig(" in source for source in sources.values())
+    assert all("TrainingConfig(" in source for source in sources.values())
+    assert all("print(layout.schema())" in source for source in sources.values())
+    assert all("save_gif(" in source for source in sources.values())
     simple = sources["simple_binary_tasks.ipynb"]
     assert 'TASK_NAME = "reverse"' in simple
     assert '"bit_not": bitwise_not_task' in simple
