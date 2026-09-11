@@ -1,14 +1,42 @@
 # ncpu-computer
 
-`ncpu-computer` is a research project for learning computation inside a small
-neural cellular automaton (NCA). A shared local neural rule evolves a spatial
-state over time. Inputs and outputs are strings written on a one-dimensional
+`ncpu-computer` studies whether computation can emerge from a small neural
+cellular automaton (NCA). One shared local rule evolves a spatial state over
+time. The model communicates with the outside world through a one-dimensional
 logical tape embedded in a two-dimensional grid.
 
 The immediate objective is to learn individual string transformations such as
 binary addition, reversal, bitwise NOT, and parity. The medium-term objective
 is to place a task-specific program in the initial state so that one fixed
 local rule can perform different computations when given different programs.
+
+## Why strings on a tape?
+
+The tape is a general interface between data and the learned computational
+substrate. Its symbols are a transport representation, not an assumption that
+every task is arithmetic or that every string denotes an integer. Any finite
+discrete value, tuple, or structured object can be used when an external codec
+serializes it into `0`, `1`, and `B`. The NCA itself receives only the resulting
+symbol sequence and does not know the source data type.
+
+For example, the same interface can express different semantics:
+
+```text
+bitwise NOT       00101      -> 11010
+string reversal   00101      -> 10100
+integer addition  111B100    -> 1011
+```
+
+Leading zeroes are therefore preserved unless a task-specific integer codec
+explicitly removes them. `B` supplies blank capacity and can separate serialized
+values. Interpretation back into integers, lists, records, or another data type
+happens outside the model and only after the complete output tape has been read.
+
+This separation gives the learned rule the same interface regardless of input
+arity, source data type, or string length. A task changes the external examples
+and interpretation, not the cellular update mechanism. It also makes failures
+inspectable: the raw tape can be evaluated exactly before any forgiving
+task-specific decoder is applied.
 
 ![A trained NCA overwriting 1011001 with its bitwise complement](assets/bit-not.gif)
 
@@ -138,34 +166,63 @@ tensor:  +1 +1 +1  0 +1 -1 -1
 
 ## Tape geometry
 
-One horizontal row of a two-dimensional NCA grid contains the logical tape.
-Logical symbols occupy regularly spaced cells with configurable horizontal
-stride `s`; the default is `s = 2`. Physical cells between logical positions
-belong to the computational medium but are not tape symbols.
-
-The grid has independently configurable empty space above, below, left, and
-right of the tape. The active logical tape excludes the left and right spatial
-borders:
+The tape contains `N` logical positions `x0 ... x(N-1)`. They occupy one
+horizontal row of the physical NCA grid with configurable stride `s`. Given
+top, bottom, left, and right borders, the physical dimensions are:
 
 ```text
-upper empty space
-
-left border | x0 . x1 . x2 . ... . xL | right border
-
-lower empty space
+height = top + 1 + bottom
+width  = left + (N - 1) * s + 1 + right
 ```
 
-Here `x0 ... xL` are logical tape cells and `.` denotes physical cells between
-them when the stride is greater than one. Input is left-aligned at `x0`.
+Logical position `xi` is the physical cell at:
+
+```text
+row = top
+column = left + i * s
+```
+
+The library defaults (`N = 12`, `s = 2`, and a border of three cells on every
+side) therefore produce a `7 x 29` grid. The tape lies on row 3 at columns
+`3, 5, 7, ..., 25`, using zero-based tensor coordinates.
+
+With the default stride `s = 2`, one ordinary physical cell lies between each
+pair of logical positions. A schematic grid is:
+
+```text
+                 physical NCA grid
+
+             top computational space
+
+left space | x0 . x1 . x2 . ... . x(N-1) | right space
+
+            bottom computational space
+```
+
+Only the `xi` cells are externally meaningful tape positions. Gap cells and
+border cells are not padding that gets skipped by the NCA: they are part of the
+mutable computational medium. They begin at zero and may carry information
+during evolution. Zero at a logical tape cell is interpreted as `B`; zero
+elsewhere is simply the neutral initial state of that physical cell.
+
+At timestep zero, the serialized input is left-aligned at `x0` in the I/O
+channel. Unused logical positions are initialized to `B`, while computation
+channels and the surrounding grid start at zero. The program channel is also
+zero in the current single-task baseline and remains exactly read-only.
 
 Input and output use the same logical positions. The NCA must overwrite the
-input with the output, which may be shorter or longer. A particular execution
-has the finite capacity supplied by its grid, but the rule itself has no
-fixed-string-length parameter and can be evaluated on wider grids.
+input rather than writing to a separate output lane. The target is left-aligned
+at `x0` and explicitly padded with `B` through `x(N-1)`. Consequently, an output
+may be shorter than its input, may consume previously blank positions and
+become longer, or may preserve the same length. Its only limit in one execution
+is the configured tape capacity.
 
-Only the strided logical tape cells participate in tape readout and tape loss.
-Physical gap cells, borders, and other grid locations remain latent computation
-space.
+Readout gathers all `N` logical positions from the I/O channel in parallel.
+Training MSE is likewise applied to every logical position across the complete
+supervision window. No tape loss is applied to physical gaps, borders, or latent
+channels. The local rule contains no `N`, so it can run unchanged on a wider
+grid; whether it actually generalizes to longer tapes is an empirical question,
+not a guarantee of the layout.
 
 ## State channels
 
