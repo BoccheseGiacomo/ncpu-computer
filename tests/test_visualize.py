@@ -67,3 +67,13 @@ def test_save_gif_writes_every_rollout_frame(tmp_path):
     assert path.is_file()
     with Image.open(path) as image:
         assert image.n_frames == 3
+
+    with pytest.raises(ValueError, match="input exceeds"):
+        save_gif(
+            rollout,
+            tmp_path / "invalid.gif",
+            layout=layout,
+            config=config,
+            input_symbols="1111",
+            target_symbols="0",
+        )

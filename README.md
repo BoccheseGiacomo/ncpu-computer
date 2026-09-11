@@ -10,6 +10,13 @@ binary addition, reversal, bitwise NOT, and parity. The medium-term objective
 is to place a task-specific program in the initial state so that one fixed
 local rule can perform different computations when given different programs.
 
+![A trained NCA overwriting 1011001 with its bitwise complement](assets/bit-not.gif)
+
+The animation is an actual trajectory from the five-channel bitwise-NOT model:
+the I/O tape changes from `1011001` to `0100110`, followed by `B`. This seed was
+trained on every binary string of length 1 through 7 and achieves 100% raw and
+interpreted accuracy throughout its complete supervision window.
+
 The repository contains the complete fixed-geometry, single-task baseline:
 ternary codecs, tape layouts, task datasets, the local NCA rule, long-window
 training, resumable checkpoints, exhaustive or sampled evaluation, inference

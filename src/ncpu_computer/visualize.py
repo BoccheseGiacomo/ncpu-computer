@@ -83,6 +83,10 @@ def save_gif(
         raise ValueError("output_mode must be 'single' or 'multiple'")
     validate_symbols(input_symbols)
     validate_symbols(target_symbols)
+    if len(input_symbols) > layout.config.tape_slots:
+        raise ValueError("input exceeds the visualized tape")
+    if len(target_symbols) > layout.config.tape_slots:
+        raise ValueError("target exceeds the visualized tape")
     config.validate()
     _validate_rollout(rollout)
     if tuple(rollout.shape[1:]) != (
