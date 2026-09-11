@@ -1,57 +1,267 @@
 # ncpu-computer
 
-`ncpu-computer` studies whether computation can emerge from a small neural
-cellular automaton (NCA). One shared local rule evolves a spatial state over
-time. The model communicates with the outside world through a one-dimensional
-logical tape embedded in a two-dimensional grid.
+`ncpu-computer` studies computation learned as the dynamics of a small neural
+cellular automaton (NCA). One local neural rule is applied at every grid cell
+and every timestep. The grid provides working memory, and repeated updates
+provide computation time.
 
-The immediate objective is to learn individual string transformations such as
-binary addition, reversal, bitwise NOT, and parity. The medium-term objective
-is to place a task-specific program in the initial state so that one fixed
-local rule can perform different computations when given different programs.
-
-## Why strings on a tape?
-
-The tape is a general interface between data and the learned computational
-substrate. Its symbols are a transport representation, not an assumption that
-every task is arithmetic or that every string denotes an integer. Any finite
-discrete value, tuple, or structured object can be used when an external codec
-serializes it into `0`, `1`, and `B`. The NCA itself receives only the resulting
-symbol sequence and does not know the source data type.
-
-For example, the same interface can express different semantics:
-
-```text
-bitwise NOT       00101      -> 11010
-string reversal   00101      -> 10100
-integer addition  111B100    -> 1011
-```
-
-Leading zeroes are therefore preserved unless a task-specific integer codec
-explicitly removes them. `B` supplies blank capacity and can separate serialized
-values. Interpretation back into integers, lists, records, or another data type
-happens outside the model and only after the complete output tape has been read.
-
-This separation gives the learned rule the same interface regardless of input
-arity, source data type, or string length. A task changes the external examples
-and interpretation, not the cellular update mechanism. It also makes failures
-inspectable: the raw tape can be evaluated exactly before any forgiving
-task-specific decoder is applied.
+Inputs and outputs use a one-dimensional logical tape embedded in the
+two-dimensional grid. The current baseline learns one task at a time on a fixed
+grid. The longer-term goal is to condition one shared rule with learned programs
+for different tasks.
 
 ![A trained NCA overwriting 1011001 with its bitwise complement](assets/bit-not.gif)
 
-The animation is an actual trajectory from the five-channel bitwise-NOT model:
-the I/O tape changes from `1011001` to `0100110`, followed by `B`. This seed was
-trained on every binary string of length 1 through 7 and achieves 100% raw and
-interpreted accuracy throughout its complete supervision window.
+This is an actual trajectory of a five-channel bitwise-NOT model. It overwrites
+`1011001` with `0100110`, followed by a blank. The shown seed was trained on all
+binary strings of lengths 1 through 7 and achieves 100% whole-tape and
+interpreted accuracy throughout its full supervision window.
 
-The repository contains the complete fixed-geometry, single-task baseline:
-ternary codecs, tape layouts, task datasets, the local NCA rule, long-window
-training, resumable checkpoints, exhaustive or sampled evaluation, inference
-interpreters, validation, tests, and a runnable notebook. Program-conditioned
-and mixed-geometry training remain deliberately deferred research stages.
+## Tape interface
 
-## Run it
+The model's logical interface is a finite sequence over three symbols. In the
+implementation, the complete sequence is represented directly as a tensor; no
+Python-string processing occurs inside the NCA.
+
+| Symbol | Tensor value | Role |
+|---|---:|---|
+| `0` | `-1` | Data symbol zero |
+| `1` | `+1` | Data symbol one |
+| `B` | `0` | Blank or separator |
+
+`B` fills unused tape positions, so an output may be shorter than the available
+tape. It can also separate multiple serialized values. All three symbols are
+valid supervised targets; `B` is not an ignored or masked value.
+
+For example, the integer operands 7 and 4 can be placed on one tape as:
+
+```text
+logical:  1  1  1  B  1  0  0
+tensor:  +1 +1 +1  0 +1 -1 -1
+```
+
+### A general, type-independent boundary
+
+The tape is a common representation boundary between external data and the
+learned system. From the NCA's perspective, every task has the same type: an
+input tensor representing a string over `{0, 1, B}`, transformed into another
+tensor of the same form. The NCA is not told whether that string represents an
+integer, a tuple, a Boolean sequence, or another finite discrete object.
+
+A deterministic external codec defines the representation for each data type.
+The reverse conversion, when needed, is performed by an external interpreter
+after inference. These components are not learned and are not part of the NCA
+dynamics:
+
+```text
+typed data
+  -> external encoder
+  -> ternary tape
+  -> NCA computation
+  -> ternary tape
+  -> optional external interpreter
+  -> typed result
+```
+
+The same interface therefore supports different semantics without changing the
+model architecture:
+
+| Task | Serialized input | Target content |
+|---|---|---|
+| Bitwise NOT | `00101` | `11010` |
+| String reversal | `00101` | `10100` |
+| Integer addition, 7 + 4 | `111B100` | `1011` |
+
+The table omits unused capacity: in the training tensor, every position after
+the target content is filled and supervised as `B`.
+
+String tasks preserve leading zeroes. Integer codecs instead use minimal binary:
+they remove leading zeroes and represent integer zero as `0`. Structured values
+can use `B` as a field separator. Continuous or unbounded objects require a
+defined finite serialization before they can use this interface.
+
+Type independence here is an interface property, not a universality claim. A
+task still determines the examples, codec, and output interpretation, and a
+trained rule must empirically learn the corresponding transformation. The
+benefit is that the NCA mechanism remains unchanged and the complete raw output
+can be evaluated before any interpreter simplifies it.
+
+## Grid layout and state
+
+### Geometry
+
+The tape has `N` logical positions, `x0 ... x(N-1)`, on one horizontal row.
+Consecutive positions are separated by a configurable physical stride `s`.
+With independently configurable borders, the grid dimensions are:
+
+```text
+height = top + 1 + bottom
+width  = left + (N - 1) * s + 1 + right
+```
+
+Logical position `xi` has the zero-based coordinate:
+
+```text
+row    = top
+column = left + i * s
+```
+
+```text
+                 top working space
+
+left working | x0 . x1 . x2 . ... . x(N-1) | right working
+
+                bottom working space
+```
+
+Here `.` denotes an ordinary physical cell between tape positions. With the
+library defaults (`N = 12`, `s = 2`, and three border cells on each side), the
+grid is `7 x 29`; the tape occupies row 3 at columns `3, 5, ..., 25`.
+
+Only the `xi` cells are read or supervised as tape symbols. The gaps and borders
+are not ignored padding: they are mutable working space available to the NCA.
+They begin at zero and may carry information during the rollout. A zero at a
+logical position represents `B`; a zero elsewhere is simply the neutral initial
+state of that physical cell.
+
+### Channels
+
+The default state has five channels:
+
+| Channel | Role | Behavior |
+|---:|---|---|
+| 0 | Program | Read-only; currently zero everywhere |
+| 1 | Input/output | Mutable |
+| 2–4 | Computation | Mutable |
+
+At timestep zero, the encoded input is left-aligned at `x0` in the I/O channel.
+Unused tape positions are `B`, and all other state values start at zero. The
+program channel is restored unchanged after every update.
+
+Input and output occupy the same logical positions. The NCA therefore overwrites
+the input rather than writing to a separate output channel. An output may be
+shorter or longer than its input, up to the configured capacity `N`. Every
+position after the target string is explicitly targeted as `B`.
+
+## Local computation
+
+Let `X_t` be the complete grid state and let `M` be one on mutable channels and
+zero on the read-only program channel. Omitting optional stochastic firing for
+clarity, one update is:
+
+```text
+D_t     = U_theta(P(X_t))
+Y_t     = clip(X_t + M * D_t)
+X_(t+1) = M * Y_t + (1 - M) * X_t
+```
+
+`P` applies a configurable bank of depthwise `3 x 3` perception kernels to each
+channel. The bank can contain fixed identity, Sobel, and Laplacian filters and
+learned kernels. `U_theta` is a shared two-layer `1 x 1` network with a ReLU
+hidden layer. Its output projection starts at zero, so the initial dynamics are
+the identity map.
+
+Optional gates and stochastic per-cell firing can modulate `D_t`, and clipping
+can be disabled. The final assignment restores the program channel exactly,
+independently of clipping. Perception, hidden width, gating, fire rate, clipping,
+padding, and channel roles are explicit hyperparameters. The default hidden
+width is 96.
+
+The same parameters are used at every location and timestep. There is no
+hand-written arithmetic, carry propagation, routing, string-length logic, or
+position-specific parameter. A wider grid changes the available state but not
+the number of parameters. It can still change the dynamics through boundary
+distance, so extrapolation to wider tapes must be measured rather than assumed.
+
+## Training
+
+Each example provides an input string and a target string. Both are embedded
+into tapes of capacity `N`. The target begins at `x0` and is padded with `B`
+through `x(N-1)`.
+
+The target is used only to calculate loss. It is never injected into the state
+or used to overwrite predictions during evolution.
+
+The NCA first runs for `F` unsupervised computation steps. Loss is then applied
+at every state in a window of `S` steps:
+
+```text
+F + 1, F + 2, ..., F + S
+```
+
+This trains the NCA to produce and retain the result over an interval. It does
+not establish stability outside that interval.
+
+The base objective is ordinary mean squared error over the batch, the complete
+supervision window, and all `N` logical tape positions:
+
+```text
+base_mse = mean((predicted_tape - target_tape)^2)
+```
+
+It includes every target blank and excludes gaps, borders, and non-I/O channels.
+Zero base MSE means exact continuous values `-1`, `0`, and `+1` over the full
+target tape, not merely correct symbol signs. Because the loss is unweighted,
+blank-heavy tapes contribute proportionally more blank terms.
+
+Two optional terms can add weight to structural blank regions:
+
+```text
+loss = base_mse
+     + terminator_weight * terminator_mse
+     + tail_weight * tail_mse
+```
+
+Both weights default to zero. For a single output, the terminator is the first
+target `B`. For multiple outputs, single blanks separate values and the final
+`BB` is the terminator. The tail is everything after the terminator. These terms
+add emphasis; the same positions remain part of the base MSE.
+
+## Readout and interpretation
+
+Readout gathers all `N` logical positions from the I/O channel in parallel into
+a tensor of shape `(batch, N)`. Training and batched evaluation remain tensorized;
+Python strings are used only for external encoding, display, or single-example
+interpretation.
+
+Continuous values are quantized with the literal threshold `0.333`:
+
+```text
+value >  0.333  -> 1
+value < -0.333  -> 0
+otherwise       -> B
+```
+
+The boundary values `-0.333` and `+0.333` decode as `B`. The literal is
+intentional and is not replaced by a computed `1/3`. Symbol correctness and MSE
+are distinct: a value may quantize correctly while remaining far from its
+continuous target.
+
+The complete tape is gathered and quantized before optional interpretation:
+
+- Single-output mode stops at the first `B`: `1011BBB0 -> 1011`.
+- Multiple-output mode uses one `B` as a separator and `BB` as the terminator:
+  `101B11BB0 -> [101, 11]`.
+
+For an integer task, these strings may then be decoded as `11` and `[5, 3]`.
+Interpretation is never part of the NCA or its training loss. Raw-tape metrics
+remain the strict test of every predicted symbol, including blanks.
+
+## Evaluation
+
+Experiments should report:
+
+- full-tape MSE, ternary-symbol accuracy, and whole-tape exact accuracy;
+- interpreted task accuracy, separately from raw accuracy;
+- accuracy at each supervised timestep and stability over the full window;
+- extrapolation to longer tapes and later times than those used in training;
+- variation across independent seeds.
+
+Longer-tape accuracy, temporal stability, and multi-task reuse are separate
+scientific questions. None follows automatically from parameter sharing or
+training-distribution performance.
+
+## Running the project
 
 From this directory on Windows:
 
@@ -62,10 +272,6 @@ pip install -e ".[dev,notebook]"
 pytest -q
 jupyter lab run/run.ipynb
 ```
-
-The environment file also installs this package in editable mode. Installing
-the development extra adds the pinned formatter and linter used by the test
-workflow.
 
 A minimal training setup is:
 
@@ -88,397 +294,62 @@ trainer = Trainer(config, dataset)
 trainer.fit("checkpoints/seed_0")
 ```
 
-The addition notebook exposes every task, geometry, model, training,
-evaluation, and GIF setting in its first code cell. That cell validates the
-experiment and prints the physical tape layout before any optional action.
-Training is not launched automatically: set its explicit `RUN_TRAINING`
-switch when ready. The notebook default batch size is 64 so its 200-step
-backpropagation graph fits a 4 GiB GPU.
-
-For unary binary-string experiments, open
-`run/simple_binary_tasks.ipynb`. Its `TASK_NAME` switch selects either reversal
-or bitwise NOT. It trains on every string up to a chosen length and evaluates
-on strings of one exact longer length, preserving leading zeroes throughout.
+`run/run.ipynb` is the binary-addition workflow.
+`run/simple_binary_tasks.ipynb` covers reversal and bitwise NOT with
+length-extrapolation evaluation. Each notebook exposes its hyperparameters in
+the first code cell, validates the configuration, and prints the physical tape
+layout before any optional action. Training and visualization run only when
+their explicit switches are enabled.
 
 ## Repository structure
 
 ```text
 src/ncpu_computer/
-  config.py       explicit geometry, model, and training configuration
-  tape.py         ternary tensor codec, strided layout, inference interpreters
-  tasks.py        generic string tasks, built-in tasks, datasets and masks
-  model.py        perception and shared residual NCA update rule
-  training.py     objectives, optimization, checkpoints, multi-seed runs
-  evaluation.py   tensorized metrics and single-example inference
-  validation.py   fast checks of the experiment's core invariants
-  visualize.py    role-aware annotated GIF rendering of NCA trajectories
-run/run.ipynb     binary-addition training and evaluation workflow
-run/simple_binary_tasks.ipynb
-                  reversal/bitwise-NOT and length-extrapolation workflow
-tests/            focused CPU regression tests
+  config.py       geometry, model, and training configuration
+  tape.py         ternary codec, strided layout, and interpreters
+  tasks.py        string tasks, datasets, and target masks
+  model.py        perception and residual NCA update rule
+  training.py     objectives, optimization, and checkpoints
+  evaluation.py   tensorized metrics and inference
+  validation.py   experiment invariant checks
+  visualize.py    annotated trajectory GIFs
+run/              training and evaluation notebooks
+tests/            CPU regression tests
 ```
 
-## Central idea
-
-The learned local rule is the computational mechanism. The grid supplies
-working memory, and repeated NCA updates supply computation time. The same rule
-is applied at every cell and at every timestep:
-
-```text
-input string -> initial spatial state -> repeated local updates -> output string
-```
-
-The rule contains no hand-written arithmetic, routing, carry propagation,
-string-length logic, or position-specific parameters. Only the external
-encoder, decoder, and training objective define how data communicates with the
-substrate. Internal computation is allowed to emerge from end-to-end
-supervision.
-
-Because the local rule is independent of grid size, a trained model can be run
-on a longer tape without increasing its parameter count. Fit on the training
-length, extrapolation to longer strings, stability over time, and reuse across
-tasks are separate scientific questions and must be measured separately.
-
-## Logical alphabet
-
-The interface uses ternary strings over the symbols `0`, `1`, and `B`:
-
-| Logical symbol | Tensor target | Meaning |
-|---|---:|---|
-| `0` | `-1` | Binary zero |
-| `B` | `0` | Blank or separator |
-| `1` | `+1` | Binary one |
-
-`B` normally provides blank space and separates values. It remains a genuine
-symbol, however, and future tasks may assign it other learned roles.
-
-The core model operates on tensors and does not assume that a string represents
-an integer. Integer codecs are optional outer utilities. When an integer is
-encoded, its minimal binary representation is used: leading zeroes are omitted,
-and integer zero is represented by the one-symbol string `0`.
-
-For example, the two operands `111` and `100` are serialized as:
-
-```text
-logical:  1  1  1  B  1  0  0
-tensor:  +1 +1 +1  0 +1 -1 -1
-```
-
-## Tape geometry
-
-The tape contains `N` logical positions `x0 ... x(N-1)`. They occupy one
-horizontal row of the physical NCA grid with configurable stride `s`. Given
-top, bottom, left, and right borders, the physical dimensions are:
-
-```text
-height = top + 1 + bottom
-width  = left + (N - 1) * s + 1 + right
-```
-
-Logical position `xi` is the physical cell at:
-
-```text
-row = top
-column = left + i * s
-```
-
-The library defaults (`N = 12`, `s = 2`, and a border of three cells on every
-side) therefore produce a `7 x 29` grid. The tape lies on row 3 at columns
-`3, 5, 7, ..., 25`, using zero-based tensor coordinates.
-
-With the default stride `s = 2`, one ordinary physical cell lies between each
-pair of logical positions. A schematic grid is:
-
-```text
-                 physical NCA grid
-
-             top computational space
-
-left space | x0 . x1 . x2 . ... . x(N-1) | right space
-
-            bottom computational space
-```
-
-Only the `xi` cells are externally meaningful tape positions. Gap cells and
-border cells are not padding that gets skipped by the NCA: they are part of the
-mutable computational medium. They begin at zero and may carry information
-during evolution. Zero at a logical tape cell is interpreted as `B`; zero
-elsewhere is simply the neutral initial state of that physical cell.
-
-At timestep zero, the serialized input is left-aligned at `x0` in the I/O
-channel. Unused logical positions are initialized to `B`, while computation
-channels and the surrounding grid start at zero. The program channel is also
-zero in the current single-task baseline and remains exactly read-only.
-
-Input and output use the same logical positions. The NCA must overwrite the
-input rather than writing to a separate output lane. The target is left-aligned
-at `x0` and explicitly padded with `B` through `x(N-1)`. Consequently, an output
-may be shorter than its input, may consume previously blank positions and
-become longer, or may preserve the same length. Its only limit in one execution
-is the configured tape capacity.
-
-Readout gathers all `N` logical positions from the I/O channel in parallel.
-Training MSE is likewise applied to every logical position across the complete
-supervision window. No tape loss is applied to physical gaps, borders, or latent
-channels. The local rule contains no `N`, so it can run unchanged on a wider
-grid; whether it actually generalizes to longer tapes is an empirical question,
-not a guarantee of the layout.
-
-## State channels
-
-The default state has five channels:
-
-| Channel | Initial role | Mutability |
-|---:|---|---|
-| 0 | Program | Read-only, initially zero everywhere |
-| 1 | Input/output tape | Always mutable |
-| 2 | Computation | Mutable |
-| 3 | Computation | Mutable |
-| 4 | Computation | Mutable |
-
-The program channel is exactly zero at initialization and is restored unchanged
-after every update while the model is trained on one task at a time. Reserving
-it now keeps the state interface compatible with the later program-conditioned
-model. The I/O channel is always mutable because it is used for both reading
-and writing.
-
-## Local neural rule
-
-The initial architecture follows the small, validated design explored in
-`ncpu-simplified`:
-
-1. Apply a bank of 3x3 depthwise perception kernels to every state channel.
-2. Mix all perceived features with a shared 1x1 convolution.
-3. Apply ReLU.
-4. Produce a per-channel update with a shared 1x1 convolution.
-5. Optionally modulate the update with a learned gate.
-6. Apply an optional stochastic per-cell fire mask.
-7. Add the update residually to the previous state.
-8. Optionally clip the mutable state.
-9. Restore read-only channels exactly.
-
-Perception may combine fixed identity, Sobel-X, Sobel-Y, and Laplacian filters
-with configurable learned 3x3 kernels. Padding mode, gates, fire rate, clipping,
-channel count, kernel bank, and hidden width remain configurable.
-
-The default hidden width is `96`. With five channels, four perception kernels,
-one shared learnable 3x3 kernel, and no gate, the corresponding rule has 2,505
-trainable scalar parameters. This is a starting point rather than a claim that
-larger rules are inherently better. Architecture comparisons must use matched
-seeds and training conditions.
-
-The delta-producing projection should begin at zero so that the initial model
-implements identity dynamics. This avoids imposing arbitrary destructive
-dynamics before learning begins.
-
-## Training semantics
-
-Each example supplies:
-
-- an input ternary string;
-- a target ternary string;
-- a logical tape capacity;
-- task metadata used only by the external data codec.
-
-Both strings are embedded into complete tape tensors. The input occupies the
-I/O channel at timestep zero. The target begins at the same leftmost logical
-position and is padded with `B` through the final logical tape position.
-
-Targets affect only loss calculation. They are never injected into the evolving
-state, never used to overwrite predictions, and never exposed to the NCA.
-
-The NCA first evolves for a configurable number of free steps. Loss is then
-applied across a long supervision window. If there are `F` free steps and `S`
-supervised steps, the supervised states are:
-
-```text
-F + 1, F + 2, ..., F + S
-```
-
-This asks the model both to compute an answer and to retain it. It does not imply
-stability outside the supervised interval.
-
-### Base loss
-
-The base objective is ordinary mean squared error over:
-
-- the batch;
-- every supervised timestep;
-- every logical tape position.
-
-The target values are exactly `-1`, `0`, and `+1`. Therefore zero base loss
-means exact numerical reproduction of the full target tape, including blank
-padding. Blank-heavy tapes intentionally contribute proportionally more blank
-terms; the base loss is not class-balanced.
-
-No base loss is applied to non-tape cells or to channels other than I/O.
-
-### Optional structural losses
-
-Two independently averaged auxiliary terms may reweight structural blank
-regions:
-
-```text
-loss = base_mse
-     + terminator_weight * terminator_mse
-     + tail_weight * tail_mse
-```
-
-Both weights default to `0`.
-
-In single-output mode, `terminator_mse` acts on the first target `B` following
-the output. In multiple-output mode, single `B` symbols between values are
-ordinary separators covered by the base loss, while `terminator_mse` acts on
-the final `BB`. `tail_mse` acts on every logical position following the
-terminator. These terms add weight; they do not remove the same cells from the
-base MSE.
-
-## Tensor readout and quantization
-
-Training and batched evaluation remain tensorized. Logical positions are
-gathered from the I/O channel into a tensor with shape:
-
-```text
-(batch, tape_length)
-```
-
-For a temporal rollout, an additional time dimension is retained. There is no
-conversion to Python strings inside the model or training path.
-
-Discrete readout uses the literal threshold `0.333`:
-
-```text
-value >  0.333  -> 1
-value < -0.333  -> 0
-otherwise       -> B
-```
-
-The exact boundary values `-0.333` and `+0.333` decode as `B`. The decimal
-literal is intentional and must not be replaced by an exact or computed `1/3`.
-
-MSE and discrete correctness measure different properties. A value can have the
-correct discrete symbol while remaining far from its numerical target.
-
-## Inference interpreters
-
-The complete logical tape is always read and quantized in parallel first. For a
-single interactive inference, this tensor may then be rendered as a string such
-as:
-
-```text
-101B11BB0
-```
-
-Interpretation is an outer inference-only operation. It is not part of the NCA,
-training loss, or raw tape readout.
-
-Two inference interpreters are provided:
-
-### Single output (default)
-
-Read from the left and stop completely at the first `B`:
-
-```text
-1011BBB0 -> binary string 1011 -> integer 11
-```
-
-### Multiple outputs
-
-A single `B` separates values. Two consecutive blanks `BB` terminate the
-complete output, and all subsequent symbols are ignored:
-
-```text
-101B11BB0 -> binary strings [101, 11] -> integers [5, 3]
-```
-
-Task-specific interpreters may be added later without changing the raw tensor
-interface. A terminated nonminimal binary string such as `01` remains a valid
-string output, but the integer view is deliberately unavailable because integer
-codecs require minimal binary representation.
-
-## Evaluation
-
-Scientific evaluation should report at least:
-
-- mean full-tape MSE across the chosen window;
-- ternary symbol accuracy;
-- whole raw-tape exact accuracy;
-- interpreted task-output exact accuracy;
-- accuracy stable across the complete supervision window;
-- per-timestep curves and best timestep;
-- extrapolation to longer tapes than those used in training;
-- behavior beyond the trained time window;
-- variation across independently trained seeds.
-
-An interpreted answer is not enough by itself: raw-tape accuracy exposes extra
-symbols, missing blanks, and other representations that an outer interpreter
-might ignore.
-
-## Program-conditioned computation
-
-The medium-term model will generate the initial program channel from a task
-index:
-
-```text
-task index -> task-specific spatial program -> shared NCA rule -> task behavior
-```
-
-Candidate mechanisms include a directly learned task embedding and a
-coordinate-conditioned CPPN that can generate a program over variable grid
-sizes. The program is a pattern in the latent state, not merely the existence of
-a channel.
-
-The intended progression is:
-
-1. Train and validate one task at a time with a zero program.
-2. Train one shared rule with a separate learned program for each task.
-3. Freeze the rule and learn only a new program for an unseen task.
-4. Study variable-size programs, grids, and computation times.
-
-Only the third stage directly tests whether the learned rule behaves as reusable
-computational hardware rather than storing every task in its weights.
-
-## Variable geometry and time
-
-The current implementation uses a simple fixed grid and fixed rollout
-schedule. A later training regime may mix examples with different active grid
-sizes inside padded tensors. An external validity mask would then define the
-real grid for each example, force the exterior to zero after every update, and
-exclude it from loss and readout.
-
-Sampling active widths and computation times is intended to reduce dependence
-on one boundary distance or one exact temporal schedule. This is deferred until
-the fixed-size implementation is correct and scientifically validated.
+## Research scope
+
+The implemented baseline uses one task, a fixed geometry, and a zero read-only
+program channel. The intended next stages are:
+
+1. Learn a separate spatial program for each task while sharing one NCA rule.
+2. Freeze the rule and learn only a new program for an unseen task.
+3. Generate programs from task indices using embeddings or a
+   coordinate-conditioned network.
+4. Train across grid sizes and computation times using explicit validity masks.
+
+The second stage is the critical test of whether the rule behaves as reusable
+computational hardware rather than storing all task behavior in its weights.
+Variable geometry and time are deliberately deferred until the fixed-geometry
+baseline is well characterized.
+
+This project does not claim computational universality. Its purpose is to test,
+with small and inspectable models, which conditions support length
+extrapolation, stable dynamics, and eventually programmable local computation.
 
 ## Engineering principles
 
-- Prefer the simplest complete design.
-- Keep the encoder, NCA dynamics, tensor readout, and inference interpreter
-  separate.
-- Enforce invariants directly rather than adding fallbacks or repair paths.
-- Fix causes, not symptoms; do not patch around incorrect logic.
-- Keep configuration explicit and checkpointed.
-- Isolate data sampling RNG from initialization and stochastic evolution where
-  required for fair comparisons.
-- Resume only from exactly compatible configurations.
-- Preserve optimizer and RNG state in resumable checkpoints.
-- Select checkpoints using exhaustive or clearly defined validation, not
-  training loss alone.
-- Compare architectures with matched seeds, data, schedules, and evaluation
-  windows.
-- Do not claim universality from finite-length extrapolation.
-- Do not launch expensive training as a substitute for focused correctness
-  tests.
+- Prefer the simplest complete implementation and enforce invariants directly.
+- Keep codecs, NCA dynamics, tensor readout, and interpreters separate.
+- Keep experimental configuration explicit and checkpoint-compatible.
+- Compare models with matched data, schedules, seeds, and evaluation windows.
+- Use focused correctness tests before expensive training runs.
 
 ## Research lineage
 
-This project develops from the local neural-computation direction explored in
+This project develops from the local neural-computation experiments in
 [`ncpu-simplified`](../ncpu-simplified) and is primarily inspired by Iliya
-Zhechev's [`ichko/ncpu`](https://github.com/ichko/ncpu). Its program-state and
-shared-substrate direction is informed by *Emergent Models: Intelligence from
-Tiny Substrates* and the distinction between learned hard parameters and a
-task-selecting latent program.
-
-The present system is not claimed to be universal. Its purpose is to test, with
-minimal and inspectable models, which ingredients lead from single-task local
-computation toward a reusable programmable substrate.
+Zhechev's [`ichko/ncpu`](https://github.com/ichko/ncpu). Its program-state
+direction is informed by *Emergent Models: Intelligence from Tiny Substrates*
+and the distinction between shared learned parameters and a task-selecting
+latent program.
