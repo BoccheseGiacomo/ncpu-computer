@@ -261,6 +261,36 @@ Longer-tape accuracy, temporal stability, and multi-task reuse are separate
 scientific questions. None follows automatically from parameter sharing or
 training-distribution performance.
 
+## Current empirical observations
+
+The tasks tried so far show a clear increase in computational difficulty:
+
+- **Bitwise NOT learns quickly.** Each output symbol depends only on the input
+  at the same tape position. The shared local rule can implement this as a
+  pointwise transformation without discovering information transport, tape
+  length, or global position.
+- **Reversal learns in-distribution but has not extrapolated to longer
+  strings.** The output at position `i` depends on the input at the reflected
+  position determined by the string length. Solving the training lengths does
+  not show that the model learned a scalable reflection algorithm: it may rely
+  on the observed boundary distances or other fixed-geometry regularities.
+  Longer strings also require information to travel farther through repeated
+  local updates.
+- **Addition has neither been learned reliably in-distribution nor generalized.**
+  With the present representation, the rule must locate the separator and both
+  operand ends, align variable-length operands by their least-significant bits,
+  propagate carries, place a possibly longer result back at `x0`, erase the
+  remaining input, and maintain the completed tape throughout supervision.
+  These coupled routing and state-management requirements are substantially
+  harder than either pointwise NOT or reversal.
+
+These results describe the configurations tested, not limitations proved for
+the architecture. In particular, addition's longer-length behavior is not yet
+a clean generalization result because the training distribution itself has not
+been solved. The observations motivate checking representation, geometry,
+rollout duration, optimization, and learned dynamics separately before changing
+the model.
+
 ## Running the project
 
 From this directory on Windows:
