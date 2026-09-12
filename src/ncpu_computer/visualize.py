@@ -78,7 +78,7 @@ def save_gif(
     target_symbols: str,
     output_mode: str = "single",
     duration_ms: int = 80,
-    scale: int = 12,
+    scale: int = 24,
 ) -> Path:
     if duration_ms < 1 or scale < 1:
         raise ValueError("duration_ms and scale must be positive")
@@ -150,7 +150,7 @@ def _annotate_frame(
     scale: int,
 ):
     left, top, bottom = 18, 116, 42
-    width = max(620, frame.width + 2 * left)
+    width = max(500, frame.width + 2 * left)
     image = Image.new("RGB", (width, frame.height + top + bottom), "#161a1f")
     image.paste(frame, (left, top))
     draw = ImageDraw.Draw(image)
@@ -184,7 +184,11 @@ def _annotate_frame(
 
     for index, (row, column) in enumerate(layout.tape_coordinates):
         x, y = left + column * scale, top + row * scale
-        draw.rectangle((x, y, x + scale - 1, y + scale - 1), outline="#ffcc33")
+        draw.rectangle(
+            (x, y, x + scale - 1, y + scale - 1),
+            outline="#ffcc33",
+            width=max(1, scale // 12),
+        )
         if scale >= 12:
             draw.text(
                 (x + scale // 2, y - 2),
@@ -206,7 +210,7 @@ def _annotate_frame(
 
 
 def _draw_io_scale(draw, left, top, io_channel, font, foreground) -> None:
-    width, height = 320, 9
+    width, height = 200, 9
     for offset in range(width):
         value = -1.0 + 2.0 * offset / (width - 1)
         draw.line(
@@ -233,7 +237,7 @@ def _draw_io_scale(draw, left, top, io_channel, font, foreground) -> None:
     )
     draw.text(
         (left + width + 18, top),
-        f"I/O channel {io_channel}\ngold: logical tape",
+        f"I/O channel {io_channel}, fixed scale\ngold: logical tape cells",
         fill=foreground,
         font=font,
     )
