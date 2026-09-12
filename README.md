@@ -342,7 +342,7 @@ src/ncpu_computer/
   training.py     objectives, optimization, and checkpoints
   evaluation.py   tensorized metrics and inference
   validation.py   experiment invariant checks
-  visualize.py    annotated trajectory GIFs
+  visualize.py    annotated I/O-channel trajectory GIFs
 run/              training and evaluation notebooks
 tests/            CPU regression tests
 ```

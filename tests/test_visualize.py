@@ -20,15 +20,23 @@ def test_evolution_phase_follows_training_window():
         evolution_phase(-1, training)
 
 
-def test_rollout_rgb_uses_selected_channels():
-    rollout = torch.zeros(2, 4, 3, 5)
-    rollout[:, 1] = 1.0
-    rollout[:, 2] = -1.0
-    rgb = rollout_rgb(rollout, (1, 2, None))
-    assert rgb.shape == (2, 3, 5, 3)
+def test_rollout_rgb_uses_fixed_io_channel_scale():
+    rollout = torch.zeros(1, 3, 1, 5)
+    rollout[0, 0] = 10.0
+    rollout[0, 1, 0] = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])
+
+    rgb = rollout_rgb(rollout, 1)
+
+    assert rgb.shape == (1, 1, 5, 3)
     assert rgb.dtype == torch.uint8
-    assert torch.all(rgb[..., 0] > rgb[..., 2])
-    assert torch.all(rgb[..., 1] < rgb[..., 2])
+    assert torch.equal(rgb[0, 0, 0], rgb[0, 0, 1])
+    assert torch.equal(rgb[0, 0, 3], rgb[0, 0, 4])
+    assert rgb[0, 0, 1, 2] > rgb[0, 0, 1, 0]
+    assert torch.equal(rgb[0, 0, 2], torch.tensor([245, 245, 245]))
+    assert rgb[0, 0, 3, 0] > rgb[0, 0, 3, 2]
+
+    with pytest.raises(ValueError, match="I/O channel"):
+        rollout_rgb(rollout, 3)
 
 
 def test_save_gif_writes_every_rollout_frame(tmp_path):

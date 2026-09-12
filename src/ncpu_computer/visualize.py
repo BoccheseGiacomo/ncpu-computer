@@ -9,6 +9,11 @@ from .config import ExperimentConfig, TrainingConfig
 from .tape import TapeLayout, interpret_tape, quantize, validate_symbols
 
 
+_IO_NEGATIVE = (59, 76, 192)
+_IO_NEUTRAL = (245, 245, 245)
+_IO_POSITIVE = (180, 4, 38)
+
+
 def evolution_phase(step: int, training: TrainingConfig) -> str:
     if step < 0:
         raise ValueError("step must be non-negative")
@@ -26,34 +31,32 @@ def _validate_rollout(rollout: torch.Tensor) -> None:
         raise ValueError("rollout must contain finite floating-point states")
 
 
-def rollout_rgb(
-    rollout: torch.Tensor, channel_indices: tuple[int | None, int | None, int | None]
-) -> torch.Tensor:
+def rollout_rgb(rollout: torch.Tensor, io_channel: int) -> torch.Tensor:
     _validate_rollout(rollout)
-    colors = []
-    for channel in channel_indices:
-        if channel is None:
-            colors.append(torch.zeros_like(rollout[:, :1]))
-        elif not 0 <= channel < rollout.shape[1]:
-            raise ValueError("RGB channel index does not exist in rollout")
-        else:
-            colors.append(rollout[:, channel : channel + 1])
-    color = torch.cat(colors, dim=1)
-    return (
-        ((torch.tanh(color) + 1.0) * 127.5).round().to(torch.uint8).permute(0, 2, 3, 1)
+    if not 0 <= io_channel < rollout.shape[1]:
+        raise ValueError("I/O channel index does not exist in rollout")
+
+    values = rollout[:, io_channel].clamp(-1.0, 1.0)
+    neutral = values.new_tensor(_IO_NEUTRAL)
+    negative = values.new_tensor(_IO_NEGATIVE)
+    positive = values.new_tensor(_IO_POSITIVE)
+    endpoint = torch.where(
+        (values < 0).unsqueeze(-1),
+        negative,
+        positive,
     )
+    color = neutral + values.abs().unsqueeze(-1) * (endpoint - neutral)
+    return color.round().to(torch.uint8)
 
 
-def _role_channels(config: ExperimentConfig) -> tuple[int, int, int | None]:
-    computation = next(
-        (
-            channel
-            for channel in range(config.model.channels)
-            if channel not in {config.model.program_channel, config.model.io_channel}
-        ),
-        None,
+def _io_color(value: float) -> tuple[int, int, int]:
+    value = max(-1.0, min(1.0, value))
+    endpoint = _IO_NEGATIVE if value < 0 else _IO_POSITIVE
+    weight = abs(value)
+    return tuple(
+        round(center + weight * (extreme - center))
+        for center, extreme in zip(_IO_NEUTRAL, endpoint)
     )
-    return config.model.program_channel, config.model.io_channel, computation
 
 
 def _raw_tapes(
@@ -97,8 +100,7 @@ def save_gif(
         raise ValueError("rollout dimensions do not match the layout and model")
 
     states = rollout.detach().cpu()
-    roles = _role_channels(config)
-    frames = rollout_rgb(states, roles).numpy()
+    frames = rollout_rgb(states, config.model.io_channel).numpy()
     raw_tapes = _raw_tapes(states, layout, config.model.io_channel)
     images = [
         Image.fromarray(frame).resize(
@@ -182,21 +184,56 @@ def _annotate_frame(
 
     for index, (row, column) in enumerate(layout.tape_coordinates):
         x, y = left + column * scale, top + row * scale
-        draw.rectangle((x, y, x + scale - 1, y + scale - 1), outline="white")
+        draw.rectangle((x, y, x + scale - 1, y + scale - 1), outline="#ffcc33")
         if scale >= 12:
             draw.text(
                 (x + scale // 2, y - 2),
                 str(index),
-                fill=foreground,
+                fill="#ffcc33",
                 font=font,
                 anchor="ms",
             )
 
-    computation = _role_channels(config)[2]
-    blue = "none" if computation is None else f"computation ch{computation}"
-    legend = (
-        f"R: program ch{config.model.program_channel}   "
-        f"G: I/O ch{config.model.io_channel}   B: {blue}   |   white: logical tape"
+    _draw_io_scale(
+        draw,
+        left,
+        top + frame.height + 8,
+        config.model.io_channel,
+        font,
+        foreground,
     )
-    draw.text((left, top + frame.height + 10), legend, fill=foreground, font=font)
     return image
+
+
+def _draw_io_scale(draw, left, top, io_channel, font, foreground) -> None:
+    width, height = 320, 9
+    for offset in range(width):
+        value = -1.0 + 2.0 * offset / (width - 1)
+        draw.line(
+            (left + offset, top, left + offset, top + height),
+            fill=_io_color(value),
+        )
+    draw.rectangle((left, top, left + width - 1, top + height), outline="#8d949c")
+
+    label_y = top + height + 3
+    draw.text((left, label_y), "0 (-1)", fill=foreground, font=font)
+    draw.text(
+        (left + width // 2, label_y),
+        "B (0)",
+        fill=foreground,
+        font=font,
+        anchor="ma",
+    )
+    draw.text(
+        (left + width, label_y),
+        "1 (+1)",
+        fill=foreground,
+        font=font,
+        anchor="ra",
+    )
+    draw.text(
+        (left + width + 18, top),
+        f"I/O channel {io_channel}\ngold: logical tape",
+        fill=foreground,
+        font=font,
+    )
