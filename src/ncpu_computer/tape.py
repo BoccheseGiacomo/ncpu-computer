@@ -24,20 +24,21 @@ def validate_symbols(symbols: str, *, allow_empty: bool = False) -> None:
 
 
 def encode_strings(strings: Sequence[str], tape_slots: int) -> torch.Tensor:
-    if tape_slots < 1:
-        raise ValueError("tape_slots must be positive")
+    if type(tape_slots) is not int or tape_slots < 1:
+        raise ValueError("tape_slots must be a positive integer")
     if not strings:
         raise ValueError("at least one string is required")
     encoded = torch.zeros(len(strings), tape_slots, dtype=torch.float32)
     for row, symbols in enumerate(strings):
-        validate_symbols(symbols)
+        validate_symbols(symbols, allow_empty=True)
         if len(symbols) > tape_slots:
             raise ValueError(
                 f"string of length {len(symbols)} exceeds {tape_slots} tape slots"
             )
-        encoded[row, : len(symbols)] = torch.tensor(
-            [SYMBOL_TO_VALUE[symbol] for symbol in symbols]
-        )
+        if symbols:
+            encoded[row, : len(symbols)] = torch.tensor(
+                [SYMBOL_TO_VALUE[symbol] for symbol in symbols]
+            )
     return encoded
 
 
@@ -91,16 +92,18 @@ def interpret_tape(values: torch.Tensor, mode: str = "single") -> InterpretedTap
     if mode == "single":
         end = raw.find("B")
         terminated = end >= 0
-        binary_strings = (raw[:end],) if terminated and end > 0 else ()
+        value = raw[:end] if terminated else raw
+        binary_strings = (value,)
+        valid = set(value) <= {"0", "1"}
     else:
         end = raw.find("BB")
         terminated = end >= 0
         prefix = raw[:end] if terminated else raw
-        parts = prefix.split("B") if prefix else []
-        binary_strings = tuple(parts) if all(parts) else ()
-    valid = terminated and bool(binary_strings)
+        parts = prefix.split("B") if prefix else [""]
+        binary_strings = tuple(parts)
+        valid = all(set(part) <= {"0", "1"} and part for part in parts)
     integer_valid = valid and all(
-        len(value) == 1 or value.startswith("1") for value in binary_strings
+        value and (len(value) == 1 or value.startswith("1")) for value in binary_strings
     )
     integers = (
         tuple(binary_to_integer(value) for value in binary_strings)
@@ -185,4 +188,4 @@ class TapeLayout:
         cells = [["." for _ in range(self.width)] for _ in range(self.height)]
         for row, column in self.tape_coordinates:
             cells[row][column] = "T"
-        return "\n".join(" ".join(row) for row in cells) + ("\nT: logical tape cell")
+        return "\n".join(" ".join(row) for row in cells) + "\nT: logical tape cell"

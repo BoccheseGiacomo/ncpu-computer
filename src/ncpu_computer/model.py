@@ -120,7 +120,9 @@ class NeuralCellularAutomaton(nn.Module):
         self.perception = Perception(config)
         self.rule = UpdateRule(config, config.channels * self.perception.kernel_count)
         update_mask = torch.ones(1, config.channels, 1, 1)
-        update_mask[:, config.program_channel] = 0.0
+        update_mask[:, : config.program_channels] = 0.0
+        if config.input_mode == "frozen":
+            update_mask[:, config.input_channel] = 0.0
         self.register_buffer("update_mask", update_mask)
 
     @property
@@ -131,20 +133,20 @@ class NeuralCellularAutomaton(nn.Module):
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
 
-    def initial_state(self, io_grid: torch.Tensor) -> torch.Tensor:
-        if io_grid.ndim != 3:
-            raise ValueError("io_grid must have shape (batch, height, width)")
-        if not torch.is_floating_point(io_grid):
-            raise ValueError("io_grid must be floating point")
+    def initial_state(self, input_grid: torch.Tensor) -> torch.Tensor:
+        if input_grid.ndim != 3:
+            raise ValueError("input_grid must have shape (batch, height, width)")
+        if not torch.is_floating_point(input_grid):
+            raise ValueError("input_grid must be floating point")
         state = torch.zeros(
-            io_grid.shape[0],
+            input_grid.shape[0],
             self.config.channels,
-            io_grid.shape[1],
-            io_grid.shape[2],
-            device=io_grid.device,
-            dtype=io_grid.dtype,
+            input_grid.shape[1],
+            input_grid.shape[2],
+            device=input_grid.device,
+            dtype=input_grid.dtype,
         )
-        state[:, self.config.io_channel] = io_grid
+        state[:, self.config.input_channel] = input_grid
         return state
 
     def step(self, state: torch.Tensor) -> torch.Tensor:
@@ -170,12 +172,11 @@ class NeuralCellularAutomaton(nn.Module):
             updated = updated.clamp(
                 -self.config.max_abs_state, self.config.max_abs_state
             )
-        updated = torch.where(self.update_mask.bool(), updated, state)
-        return updated
+        return torch.where(self.update_mask.bool(), updated, state)
 
     def forward(self, initial_state: torch.Tensor, steps: int) -> torch.Tensor:
-        if steps < 0:
-            raise ValueError("steps cannot be negative")
+        if type(steps) is not int or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
         states = [initial_state]
         state = initial_state
         for _ in range(steps):

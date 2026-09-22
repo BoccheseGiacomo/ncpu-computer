@@ -50,10 +50,6 @@ class EvaluationResult:
             "symbol": self.mean_symbol_accuracy,
             "stable_semantic": self.stable_semantic_accuracy,
             "stable_raw": self.stable_raw_accuracy,
-            "best_semantic_step": self.best_semantic_step,
-            "best_semantic": self.best_semantic_accuracy,
-            "best_mse_step": self.best_mse_step,
-            "best_mse": self.best_mse,
         }
 
 
@@ -67,25 +63,27 @@ def evaluate(
     step_start: int,
     step_end: int,
     batch_size: int = 256,
-    max_examples: int | None = None,
     seed: int = 0,
+    max_examples: int | None = None,
 ) -> EvaluationResult:
+    geometry.validate()
     if dataset.tape_slots != geometry.tape_slots:
         raise ValueError("dataset and geometry have different tape capacities")
-    counts = (steps, step_start, step_end, batch_size, seed)
-    if any(type(value) is not int for value in counts):
-        raise TypeError("steps, batch_size, and seed must be integers")
-    if batch_size < 1:
+    if (
+        type(steps) is not int
+        or type(step_start) is not int
+        or type(step_end) is not int
+    ):
+        raise TypeError("evaluation steps must be integers")
+    if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be positive")
-    if seed < 0:
-        raise ValueError("seed cannot be negative")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
     if not 0 <= step_start <= step_end <= steps:
         raise ValueError("evaluation steps must satisfy 0 <= start <= end <= steps")
     if max_examples is not None:
-        if type(max_examples) is not int:
-            raise TypeError("max_examples must be an integer or None")
-        if max_examples < 1:
-            raise ValueError("max_examples must be positive or None")
+        if type(max_examples) is not int or max_examples < 1:
+            raise ValueError("max_examples must be a positive integer or None")
 
     generator = torch.Generator().manual_seed(seed)
     if max_examples is not None and max_examples < len(dataset):
@@ -114,12 +112,11 @@ def evaluate(
                 torch.cuda.manual_seed_all(seed)
             for offset in range(0, count, batch_size):
                 batch_indices = indices[offset : offset + batch_size]
-                inputs, targets, lengths, _, _ = (
+                inputs, targets, lengths = (
                     value.to(device) for value in dataset.take(batch_indices)
                 )
-                io_grid = layout.render_tape(inputs)
-                rollout = model(model.initial_state(io_grid), steps)
-                values = layout.extract_tape(rollout[:, :, model.config.io_channel])
+                rollout = model(model.initial_state(layout.render_tape(inputs)), steps)
+                values = layout.extract_tape(rollout[:, :, model.config.output_channel])
                 expected = targets.unsqueeze(1)
                 discrete = quantize(values)
                 discrete_targets = targets.to(torch.int8)
@@ -188,20 +185,17 @@ def infer(
     steps: int,
     output_mode: str = "single",
 ) -> InferenceResult:
-    if type(steps) is not int:
-        raise TypeError("steps must be an integer")
-    if steps < 0:
-        raise ValueError("steps cannot be negative")
+    if type(steps) is not int or steps < 0:
+        raise ValueError("steps must be a non-negative integer")
     if output_mode not in {"single", "multiple"}:
         raise ValueError("output_mode must be 'single' or 'multiple'")
     layout = TapeLayout(geometry)
-    device = model.device
-    encoded = encode_strings((input_symbols,), geometry.tape_slots).to(device)
+    encoded = encode_strings((input_symbols,), geometry.tape_slots).to(model.device)
     initial = model.initial_state(layout.render_tape(encoded))
     was_training = model.training
     model.eval()
     try:
-        final = model(initial, steps)[:, -1, model.config.io_channel]
+        final = model(initial, steps)[:, -1, model.config.output_channel]
         values = layout.extract_tape(final)[0].cpu()
     finally:
         model.train(was_training)
@@ -224,7 +218,8 @@ def format_results(results: list[EvaluationResult]) -> str:
             f"{result.task[:16]:<16} {result.examples:>5} "
             f"{result.tape_slots:>5}  {result.step_start:>3}-{result.step_end:<3} "
             f"{result.mean_mse:>9.6f}  {result.mean_semantic_accuracy:>8.2%} "
-            f"{result.mean_raw_accuracy:>8.2%} {result.mean_symbol_accuracy:>8.2%} "
+            f"{result.mean_raw_accuracy:>8.2%} "
+            f"{result.mean_symbol_accuracy:>8.2%} "
             f"{result.stable_semantic_accuracy:>8.2%}"
         )
     return "\n".join(lines)

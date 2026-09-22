@@ -15,6 +15,9 @@ from .tape import TapeLayout, quantize
 from .tasks import TaskDataset, semantic_correct
 
 
+CHECKPOINT_FORMAT = 3
+
+
 def resolve_device(requested: str) -> torch.device:
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -28,32 +31,15 @@ def resolve_device(requested: str) -> torch.device:
 class LossComponents:
     total: torch.Tensor
     base: torch.Tensor
-    terminator: torch.Tensor
-    tail: torch.Tensor
-
-
-def _masked_mean(error: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    if mask.shape != (error.shape[0], error.shape[2]):
-        raise ValueError("loss mask shape does not match prediction")
-    mask = mask.to(device=error.device, dtype=error.dtype).unsqueeze(1)
-    count = mask.sum() * error.shape[1]
-    if float(count) == 0.0:
-        return error.sum() * 0.0
-    return (error * mask).sum() / count
 
 
 def supervised_loss(
     rollout: torch.Tensor,
     target: torch.Tensor,
     layout: TapeLayout,
-    io_channel: int,
+    output_channel: int,
     free_steps: int,
     supervision_steps: int,
-    terminator_mask: torch.Tensor,
-    tail_mask: torch.Tensor,
-    *,
-    terminator_weight: float = 0.0,
-    tail_weight: float = 0.0,
 ) -> LossComponents:
     start = free_steps + 1
     end = start + supervision_steps
@@ -61,23 +47,16 @@ def supervised_loss(
         raise ValueError(
             "rollout must have shape (batch, time, channels, height, width)"
         )
-    if not 0 <= io_channel < rollout.shape[2]:
-        raise ValueError("io_channel does not exist in rollout")
+    if not 0 <= output_channel < rollout.shape[2]:
+        raise ValueError("output_channel does not exist in rollout")
     if start < 1 or end > rollout.shape[1]:
         raise ValueError("rollout does not cover the supervision window")
     if target.shape != (rollout.shape[0], layout.config.tape_slots):
         raise ValueError("target shape does not match rollout and tape layout")
-    if terminator_weight < 0 or tail_weight < 0:
-        raise ValueError("auxiliary loss weights cannot be negative")
-
-    prediction = layout.extract_tape(rollout[:, start:end, io_channel])
+    prediction = layout.extract_tape(rollout[:, start:end, output_channel])
     expected = target.to(prediction.device).unsqueeze(1)
-    error = (prediction - expected).square()
-    base = error.mean()
-    terminator = _masked_mean(error, terminator_mask)
-    tail = _masked_mean(error, tail_mask)
-    total = base + terminator_weight * terminator + tail_weight * tail
-    return LossComponents(total=total, base=base, terminator=terminator, tail=tail)
+    base = (prediction - expected).square().mean()
+    return LossComponents(total=base, base=base)
 
 
 def cosine_learning_rate(config: ExperimentConfig, update: int) -> float:
@@ -101,8 +80,6 @@ class StepMetrics:
     update: int
     loss: float
     base_loss: float
-    terminator_loss: float
-    tail_loss: float
     learning_rate: float
     gradient_norm: float
     semantic_accuracy: float
@@ -110,18 +87,7 @@ class StepMetrics:
     validation_loss: float | None = None
 
     def to_dict(self) -> dict[str, float | int | None]:
-        return {
-            "update": self.update,
-            "loss": self.loss,
-            "base_loss": self.base_loss,
-            "terminator_loss": self.terminator_loss,
-            "tail_loss": self.tail_loss,
-            "learning_rate": self.learning_rate,
-            "gradient_norm": self.gradient_norm,
-            "semantic_accuracy": self.semantic_accuracy,
-            "raw_accuracy": self.raw_accuracy,
-            "validation_loss": self.validation_loss,
-        }
+        return self.__dict__.copy()
 
 
 @dataclass(frozen=True)
@@ -165,32 +131,21 @@ class Trainer:
         self.best_validation_loss = math.inf
         self.history: list[dict[str, float | int | None]] = []
 
-    def _prepare(self, batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        inputs, targets, lengths, terminator, tail = (
-            value.to(self.device) for value in batch
-        )
-        io_grid = self.layout.render_tape(inputs)
-        return io_grid, targets, lengths, terminator, tail
+    def _prepare(
+        self, batch: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        inputs, targets, lengths = (value.to(self.device) for value in batch)
+        return self.layout.render_tape(inputs), targets, lengths
 
-    def _loss(
-        self,
-        rollout: torch.Tensor,
-        targets: torch.Tensor,
-        terminator: torch.Tensor,
-        tail: torch.Tensor,
-    ) -> LossComponents:
+    def _loss(self, rollout: torch.Tensor, targets: torch.Tensor) -> LossComponents:
         training = self.config.training
         return supervised_loss(
             rollout,
             targets,
             self.layout,
-            self.config.model.io_channel,
+            self.config.model.output_channel,
             training.free_steps,
             training.supervision_steps,
-            terminator,
-            tail,
-            terminator_weight=training.terminator_weight,
-            tail_weight=training.tail_weight,
         )
 
     def train_step(self) -> StepMetrics:
@@ -198,19 +153,17 @@ class Trainer:
         learning_rate = cosine_learning_rate(self.config, self.current_update)
         for group in self.optimizer.param_groups:
             group["lr"] = learning_rate
-        batch = self.dataset.sample(
-            self.config.training.batch_size, self.data_generator
+        input_grid, targets, lengths = self._prepare(
+            self.dataset.sample(self.config.training.batch_size, self.data_generator)
         )
-        io_grid, targets, lengths, terminator, tail = self._prepare(batch)
         rollout = self.model(
-            self.model.initial_state(io_grid), self.config.training.rollout_steps
+            self.model.initial_state(input_grid), self.config.training.rollout_steps
         )
-        losses = self._loss(rollout, targets, terminator, tail)
+        losses = self._loss(rollout, targets)
         if not torch.isfinite(losses.total):
             raise FloatingPointError(
                 f"non-finite loss at update {self.current_update + 1}"
             )
-
         self.optimizer.zero_grad(set_to_none=True)
         losses.total.backward()
         if self.config.training.grad_clip is None:
@@ -233,22 +186,20 @@ class Trainer:
         self.optimizer.step()
 
         with torch.no_grad():
-            final = quantize(
-                self.layout.extract_tape(rollout[:, -1, self.config.model.io_channel])
+            values = self.layout.extract_tape(
+                rollout[:, -1, self.config.model.output_channel]
             )
+            final = quantize(values)
             discrete_targets = targets.to(torch.int8)
             raw = (final == discrete_targets).all(dim=1)
             semantic = semantic_correct(
                 final, discrete_targets, lengths, self.dataset.output_mode
             )
-
         self.current_update += 1
         return StepMetrics(
             update=self.current_update,
             loss=float(losses.total.detach()),
             base_loss=float(losses.base.detach()),
-            terminator_loss=float(losses.terminator.detach()),
-            tail_loss=float(losses.tail.detach()),
             learning_rate=learning_rate,
             gradient_norm=gradient_norm,
             semantic_accuracy=float(semantic.float().mean()),
@@ -259,8 +210,8 @@ class Trainer:
     def validation_loss(self) -> float:
         was_training = self.model.training
         self.model.eval()
-        component_sums = {"base": 0.0, "terminator": 0.0, "tail": 0.0}
-        component_counts = {"base": 0.0, "terminator": 0.0, "tail": 0.0}
+        loss_sum = 0.0
+        example_count = 0
         devices = [self.device.index or 0] if self.device.type == "cuda" else []
         try:
             with torch.random.fork_rng(devices=devices):
@@ -274,33 +225,16 @@ class Trainer:
                         offset + self.config.training.batch_size, len(self.dataset)
                     )
                     indices = torch.arange(offset, end)
-                    io_grid, targets, _, terminator, tail = self._prepare(
-                        self.dataset.take(indices)
-                    )
+                    input_grid, targets, _ = self._prepare(self.dataset.take(indices))
                     rollout = self.model(
-                        self.model.initial_state(io_grid),
+                        self.model.initial_state(input_grid),
                         self.config.training.rollout_steps,
                     )
-                    losses = self._loss(rollout, targets, terminator, tail)
-                    weights = {
-                        "base": float(len(indices) * self.dataset.tape_slots),
-                        "terminator": float(terminator.sum()),
-                        "tail": float(tail.sum()),
-                    }
-                    for name, weight in weights.items():
-                        component_sums[name] += float(getattr(losses, name)) * weight
-                        component_counts[name] += weight
+                    loss_sum += float(self._loss(rollout, targets).base) * len(indices)
+                    example_count += len(indices)
         finally:
             self.model.train(was_training)
-        means = {
-            name: (component_sums[name] / count if count else 0.0)
-            for name, count in component_counts.items()
-        }
-        return (
-            means["base"]
-            + self.config.training.terminator_weight * means["terminator"]
-            + self.config.training.tail_weight * means["tail"]
-        )
+        return loss_sum / example_count
 
     def fit(
         self,
@@ -319,8 +253,9 @@ class Trainer:
                 or metrics.update == self.config.training.updates
             )
             validation_loss = self.validation_loss() if should_validate else None
-            is_best = validation_loss is not None and (
-                validation_loss < self.best_validation_loss
+            is_best = (
+                validation_loss is not None
+                and validation_loss < self.best_validation_loss
             )
             if is_best:
                 self.best_validation_loss = validation_loss
@@ -349,7 +284,7 @@ class Trainer:
 
     def checkpoint(self) -> dict:
         state = {
-            "format_version": 1,
+            "format_version": CHECKPOINT_FORMAT,
             "config": self.config.to_dict(),
             "dataset_signature": self.dataset.signature,
             "dataset_name": self.dataset.name,
@@ -382,8 +317,8 @@ class Trainer:
         device: str | None = None,
     ) -> "Trainer":
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if checkpoint.get("format_version") != 1:
-            raise ValueError("unsupported checkpoint format")
+        if checkpoint.get("format_version") != CHECKPOINT_FORMAT:
+            raise ValueError("checkpoint uses an incompatible model representation")
         if checkpoint.get("dataset_signature") != dataset.signature:
             raise ValueError("checkpoint dataset does not match the supplied dataset")
         config_data = checkpoint["config"]
@@ -411,8 +346,8 @@ def load_model(
 ) -> tuple[NeuralCellularAutomaton, ExperimentConfig, dict]:
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved, weights_only=False)
-    if checkpoint.get("format_version") != 1:
-        raise ValueError("unsupported checkpoint format")
+    if checkpoint.get("format_version") != CHECKPOINT_FORMAT:
+        raise ValueError("checkpoint uses an incompatible model representation")
     config = ExperimentConfig.from_dict(checkpoint["config"])
     model = NeuralCellularAutomaton(config.model).to(resolved)
     model.load_state_dict(checkpoint["model"], strict=True)

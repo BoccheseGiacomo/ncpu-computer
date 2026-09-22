@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from ncpu_computer.config import ExperimentConfig, GeometryConfig
+from ncpu_computer.config import ExperimentConfig, GeometryConfig, ModelConfig
 from ncpu_computer.tape import (
     TERNARY_THRESHOLD,
     TapeLayout,
@@ -16,9 +16,15 @@ from ncpu_computer.tape import (
 )
 
 
-def test_config_round_trip_and_validation():
-    config = ExperimentConfig(geometry=GeometryConfig(tape_slots=7, stride=3))
+def test_config_round_trip_and_channel_roles():
+    config = ExperimentConfig(
+        geometry=GeometryConfig(tape_slots=7, stride=3),
+        model=ModelConfig(program_channels=2, computation_channels=4),
+    )
     assert ExperimentConfig.from_dict(config.to_dict()) == config
+    assert config.model.input_channel == 2
+    assert config.model.output_channel == 3
+    assert config.model.channels == 8
     with pytest.raises(ValueError, match="tape_slots"):
         replace(config.geometry, tape_slots=0).validate()
     with pytest.raises(TypeError, match="integers"):
@@ -43,9 +49,13 @@ def test_layout_renders_only_strided_tape_cells():
     assert torch.count_nonzero(grid) == 3
 
 
-def test_string_encoding_and_strict_ternary_quantization():
-    encoded = encode_strings(("10B", "B01"), tape_slots=4)
-    assert encoded.tolist() == [[1.0, -1.0, 0.0, 0.0], [0.0, -1.0, 1.0, 0.0]]
+def test_string_encoding_is_direct_ternary_with_implicit_blank_padding():
+    encoded = encode_strings(("10B", "", "B01"), tape_slots=4)
+    assert encoded.tolist() == [
+        [1.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 1.0, 0.0],
+    ]
     values = torch.tensor(
         [
             -TERNARY_THRESHOLD - 1e-6,
@@ -68,24 +78,13 @@ def test_integer_codec_is_minimal_binary():
         binary_to_integer("00")
 
 
-def test_single_and_multiple_inference_interpreters():
-    single = interpret_tape(torch.tensor([1.0, -1.0, 1.0, 1.0, 0.0, 0.0]))
-    assert single.valid
-    assert single.raw == "1011BB"
+def test_interpreters_accept_explicit_blank_or_tape_boundary():
+    single = interpret_tape(torch.tensor([1.0, -1.0, 1.0, 1.0, 0.0]))
+    assert single.valid and single.terminated
     assert single.binary_strings == ("1011",)
     assert single.integers == (11,)
-
-    multiple = interpret_tape(
-        torch.tensor([1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, -1.0]),
-        "multiple",
-    )
-    assert multiple.valid
-    assert multiple.binary_strings == ("101", "11")
-    assert multiple.integers == (5, 3)
-    assert interpret_tape(torch.ones(4), "single").valid is False
-
-    nonminimal = interpret_tape(torch.tensor([-1.0, 1.0, 0.0]), "single")
-    assert nonminimal.valid
-    assert nonminimal.binary_strings == ("01",)
-    assert not nonminimal.integer_valid
-    assert nonminimal.integers == ()
+    full = interpret_tape(torch.tensor([1.0, -1.0, 1.0, 1.0]))
+    assert full.valid and not full.terminated
+    empty = interpret_tape(torch.zeros(3))
+    assert empty.valid and empty.binary_strings == ("",)
+    assert not empty.integer_valid

@@ -30,13 +30,15 @@ class StringTask:
         if self.output_mode not in {"single", "multiple"}:
             raise ValueError("output_mode must be 'single' or 'multiple'")
         for example in self.examples:
-            validate_symbols(example.input)
-            validate_symbols(example.target)
-            if example.target.startswith("B") or example.target.endswith("B"):
+            validate_symbols(example.input, allow_empty=True)
+            validate_symbols(example.target, allow_empty=True)
+            if example.target and (
+                example.target.startswith("B") or example.target.endswith("B")
+            ):
                 raise ValueError("targets cannot begin or end with B")
             if self.output_mode == "single" and "B" in example.target:
                 raise ValueError("single-output targets cannot contain B")
-            if self.output_mode == "multiple":
+            if self.output_mode == "multiple" and example.target:
                 if "BB" in example.target:
                     raise ValueError("multiple-output values use single-B separators")
                 if any(not part for part in example.target.split("B")):
@@ -58,17 +60,30 @@ def addition_task(operand_bits: int) -> StringTask:
     return StringTask(name=f"addition-{operand_bits}-bit", examples=examples)
 
 
-def binary_strings(max_length: int, *, include_shorter: bool = True) -> tuple[str, ...]:
-    if max_length < 1:
-        raise ValueError("max_length must be positive")
+def binary_strings(
+    max_length: int,
+    *,
+    include_shorter: bool = True,
+    include_empty: bool = True,
+) -> tuple[str, ...]:
+    if type(max_length) is not int or max_length < 1:
+        raise ValueError("max_length must be a positive integer")
+    if include_empty and not include_shorter:
+        raise ValueError("include_empty requires include_shorter")
     lengths = range(1, max_length + 1) if include_shorter else (max_length,)
-    return tuple(
+    strings = [""] if include_empty else []
+    strings.extend(
         "".join(bits) for length in lengths for bits in product("01", repeat=length)
     )
+    return tuple(strings)
 
 
 def reverse_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
-    strings = binary_strings(max_length, include_shorter=include_shorter)
+    strings = binary_strings(
+        max_length,
+        include_shorter=include_shorter,
+        include_empty=include_shorter,
+    )
     scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
         name=f"reverse-{scope}",
@@ -77,7 +92,11 @@ def reverse_task(max_length: int, *, include_shorter: bool = True) -> StringTask
 
 
 def bitwise_not_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
-    strings = binary_strings(max_length, include_shorter=include_shorter)
+    strings = binary_strings(
+        max_length,
+        include_shorter=include_shorter,
+        include_empty=include_shorter,
+    )
     scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
         name=f"bit-not-{scope}",
@@ -92,7 +111,11 @@ def bitwise_not_task(max_length: int, *, include_shorter: bool = True) -> String
 
 
 def parity_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
-    strings = binary_strings(max_length, include_shorter=include_shorter)
+    strings = binary_strings(
+        max_length,
+        include_shorter=include_shorter,
+        include_empty=include_shorter,
+    )
     scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
         name=f"parity-{scope}",
@@ -112,36 +135,25 @@ class TaskDataset:
     inputs: torch.Tensor
     targets: torch.Tensor
     target_lengths: torch.Tensor
-    terminator_mask: torch.Tensor
-    tail_mask: torch.Tensor
 
     @classmethod
     def from_task(cls, task: StringTask, tape_slots: int) -> "TaskDataset":
         inputs = tuple(example.input for example in task.examples)
         targets = tuple(example.target for example in task.examples)
-        terminator_width = 1 if task.output_mode == "single" else 2
         if max(map(len, inputs)) > tape_slots:
             raise ValueError("an input exceeds the configured tape capacity")
-        if max(map(len, targets)) + terminator_width > tape_slots:
-            raise ValueError("the tape must leave room for the output terminator")
-        encoded_inputs = encode_strings(inputs, tape_slots)
-        encoded_targets = encode_strings(targets, tape_slots)
-        lengths = torch.tensor([len(target) for target in targets], dtype=torch.int64)
-        positions = torch.arange(tape_slots).unsqueeze(0)
-        terminator_mask = (positions >= lengths.unsqueeze(1)) & (
-            positions < lengths.unsqueeze(1) + terminator_width
-        )
-        tail_mask = positions >= lengths.unsqueeze(1) + terminator_width
+        if max(map(len, targets)) > tape_slots:
+            raise ValueError("an output exceeds the configured tape capacity")
         return cls(
             name=task.name,
             output_mode=task.output_mode,
             input_strings=inputs,
             target_strings=targets,
-            inputs=encoded_inputs,
-            targets=encoded_targets,
-            target_lengths=lengths,
-            terminator_mask=terminator_mask,
-            tail_mask=tail_mask,
+            inputs=encode_strings(inputs, tape_slots),
+            targets=encode_strings(targets, tape_slots),
+            target_lengths=torch.tensor(
+                [len(target) for target in targets], dtype=torch.int64
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -152,14 +164,12 @@ class TaskDataset:
             raise ValueError("inputs and targets must be matching rank-two tensors")
         if self.inputs.shape[0] != count:
             raise ValueError("tensor and string example counts differ")
-        expected_vector = (count,)
-        expected_matrix = self.inputs.shape
-        if self.target_lengths.shape != expected_vector:
+        if not torch.is_floating_point(self.inputs) or not torch.is_floating_point(
+            self.targets
+        ):
+            raise ValueError("inputs and targets must be floating point")
+        if self.target_lengths.shape != (count,):
             raise ValueError("target_lengths has the wrong shape")
-        if self.terminator_mask.shape != expected_matrix:
-            raise ValueError("terminator_mask has the wrong shape")
-        if self.tail_mask.shape != expected_matrix:
-            raise ValueError("tail_mask has the wrong shape")
 
     def __len__(self) -> int:
         return len(self.input_strings)
@@ -185,8 +195,6 @@ class TaskDataset:
             self.inputs[indices],
             self.targets[indices],
             self.target_lengths[indices],
-            self.terminator_mask[indices],
-            self.tail_mask[indices],
         )
 
     def sample(
@@ -204,7 +212,6 @@ def semantic_correct(
     target_lengths: torch.Tensor,
     output_mode: str,
 ) -> torch.Tensor:
-    """Compare a quantized batch through the required output terminator."""
     prediction = torch.as_tensor(prediction)
     target = torch.as_tensor(target, device=prediction.device)
     target_lengths = torch.as_tensor(
@@ -225,9 +232,10 @@ def semantic_correct(
     if output_mode not in {"single", "multiple"}:
         raise ValueError("output_mode must be 'single' or 'multiple'")
     terminator_width = 1 if output_mode == "single" else 2
-    required_end = target_lengths + terminator_width
-    if bool((required_end > tape_slots).any()):
-        raise ValueError("target and terminator exceed the tape")
+    required_end = torch.minimum(
+        target_lengths + terminator_width,
+        torch.full_like(target_lengths, tape_slots),
+    )
     positions = torch.arange(tape_slots, device=prediction.device).view(1, 1, -1)
     required = positions < required_end.view(batch, 1, 1)
     correct = ((prediction == target.unsqueeze(1)) | ~required).all(dim=-1)

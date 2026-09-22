@@ -1,5 +1,11 @@
 from .config import ExperimentConfig, GeometryConfig, ModelConfig, TrainingConfig
-from .evaluation import EvaluationResult, InferenceResult, evaluate, infer
+from .evaluation import (
+    EvaluationResult,
+    InferenceResult,
+    evaluate,
+    format_results,
+    infer,
+)
 from .model import NeuralCellularAutomaton
 from .tape import (
     TERNARY_THRESHOLD,
@@ -17,6 +23,7 @@ from .tasks import (
     StringTask,
     TaskDataset,
     addition_task,
+    binary_strings,
     bitwise_not_task,
     parity_task,
     reverse_task,
@@ -54,10 +61,13 @@ __all__ = [
     "TrainingConfig",
     "ValidationReport",
     "addition_task",
+    "binary_strings",
     "binary_to_integer",
     "bitwise_not_task",
     "encode_strings",
     "evaluate",
+    "evolution_phase",
+    "format_results",
     "infer",
     "integer_to_binary",
     "interpret_tape",
@@ -65,12 +75,11 @@ __all__ = [
     "parity_task",
     "quantize",
     "reverse_task",
+    "rollout_rgb",
+    "save_gif",
     "semantic_correct",
     "supervised_loss",
     "tensor_to_symbols",
     "train_seeds",
     "validate_experiment",
-    "evolution_phase",
-    "rollout_rgb",
-    "save_gif",
 ]

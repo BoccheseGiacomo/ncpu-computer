@@ -11,7 +11,7 @@ SUPPORTED_GATES = {"none", "linear", "sigmoid", "tanh", "relu"}
 
 @dataclass(frozen=True)
 class GeometryConfig:
-    tape_slots: int = 12
+    tape_slots: int = 8
     stride: int = 2
     border_left: int = 3
     border_right: int = 3
@@ -33,19 +33,15 @@ class GeometryConfig:
             raise ValueError("tape_slots must be at least 1")
         if self.stride < 1:
             raise ValueError("stride must be positive")
-        borders = (
-            self.border_left,
-            self.border_right,
-            self.border_top,
-            self.border_bottom,
-        )
-        if any(border < 0 for border in borders):
+        if any(value < 0 for value in values[2:]):
             raise ValueError("borders cannot be negative")
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    channels: int = 5
+    program_channels: int = 1
+    computation_channels: int = 3
+    input_mode: str = "mutable"
     hidden_size: int = 96
     fixed_kernels: tuple[str, ...] = ("identity", "sobel_x", "sobel_y")
     fixed_laplacian: bool = False
@@ -54,23 +50,40 @@ class ModelConfig:
     gate: str = "none"
     gate_bias: float = 1.0
     fire_rate: float = 1.0
-    program_channel: int = 0
-    io_channel: int = 1
     padding: str = "zeros"
     max_abs_state: float | None = 10.0
     random_kernel_seed: int = 0
 
+    @property
+    def input_channel(self) -> int:
+        return self.program_channels
+
+    @property
+    def output_channel(self) -> int:
+        return self.program_channels + 1
+
+    @property
+    def channels(self) -> int:
+        return self.program_channels + 2 + self.computation_channels
+
     def validate(self) -> None:
         integers = (
-            self.channels,
+            self.program_channels,
+            self.computation_channels,
             self.hidden_size,
             self.learnable_kernels,
-            self.program_channel,
-            self.io_channel,
             self.random_kernel_seed,
         )
         if any(type(value) is not int for value in integers):
             raise TypeError("model dimensions, channels, and seeds must be integers")
+        if self.program_channels < 1:
+            raise ValueError("program_channels must be positive")
+        if self.computation_channels < 0:
+            raise ValueError("computation_channels cannot be negative")
+        if self.input_mode not in {"mutable", "frozen"}:
+            raise ValueError("input_mode must be 'mutable' or 'frozen'")
+        if self.hidden_size < 1:
+            raise ValueError("hidden_size must be positive")
         if self.random_kernel_seed < 0:
             raise ValueError("random_kernel_seed cannot be negative")
         numeric = (self.gate_bias, self.fire_rate)
@@ -78,16 +91,6 @@ class ModelConfig:
             numeric += (self.max_abs_state,)
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("model scalar hyperparameters must be finite")
-        if self.channels < 2:
-            raise ValueError("channels must be at least 2")
-        if self.hidden_size < 1:
-            raise ValueError("hidden_size must be at least 1")
-        if not 0 <= self.program_channel < self.channels:
-            raise ValueError("program_channel must refer to an existing channel")
-        if not 0 <= self.io_channel < self.channels:
-            raise ValueError("io_channel must refer to an existing channel")
-        if self.program_channel == self.io_channel:
-            raise ValueError("program and I/O channels must be distinct")
         if (
             not self.fixed_kernels
             and not self.fixed_laplacian
@@ -124,8 +127,6 @@ class TrainingConfig:
     warmup_updates: int = 0
     weight_decay: float = 2e-5
     grad_clip: float | None = 0.8
-    terminator_weight: float = 0.0
-    tail_weight: float = 0.0
     seed: int = 0
     validation_every: int = 50
     checkpoint_every: int = 50
@@ -162,8 +163,6 @@ class TrainingConfig:
             self.learning_rate,
             self.final_learning_rate,
             self.weight_decay,
-            self.terminator_weight,
-            self.tail_weight,
         )
         if self.grad_clip is not None:
             numeric += (self.grad_clip,)
@@ -183,8 +182,6 @@ class TrainingConfig:
             raise ValueError("weight_decay cannot be negative")
         if self.grad_clip is not None and self.grad_clip <= 0:
             raise ValueError("grad_clip must be positive or None")
-        if self.terminator_weight < 0 or self.tail_weight < 0:
-            raise ValueError("auxiliary loss weights cannot be negative")
         if self.validation_every < 1 or self.checkpoint_every < 1:
             raise ValueError("validation and checkpoint intervals must be positive")
         if self.device != "auto" and not (
