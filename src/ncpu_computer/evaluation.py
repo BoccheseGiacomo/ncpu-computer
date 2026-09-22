@@ -7,7 +7,7 @@ import torch
 from .config import GeometryConfig
 from .model import NeuralCellularAutomaton
 from .tape import InterpretedTape, TapeLayout, encode_strings, interpret_tape, quantize
-from .tasks import TaskDataset, semantic_correct
+from .tasks import MultiTaskDataset, TaskDataset, semantic_correct
 
 
 @dataclass(frozen=True)
@@ -67,8 +67,11 @@ def evaluate(
     max_examples: int | None = None,
 ) -> EvaluationResult:
     geometry.validate()
+    if geometry != model.geometry:
+        raise ValueError("evaluation geometry differs from the fixed model geometry")
     if dataset.tape_slots != geometry.tape_slots:
         raise ValueError("dataset and geometry have different tape capacities")
+    task_index = model.task_index(dataset.name)
     if (
         type(steps) is not int
         or type(step_start) is not int
@@ -115,7 +118,15 @@ def evaluate(
                 inputs, targets, lengths = (
                     value.to(device) for value in dataset.take(batch_indices)
                 )
-                rollout = model(model.initial_state(layout.render_tape(inputs)), steps)
+                task_indices = torch.full(
+                    (len(batch_indices),),
+                    task_index,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                rollout = model(
+                    model.initial_state(layout.render_tape(inputs), task_indices), steps
+                )
                 values = layout.extract_tape(rollout[:, :, model.config.output_channel])
                 expected = targets.unsqueeze(1)
                 discrete = quantize(values)
@@ -170,6 +181,7 @@ def evaluate(
 
 @dataclass(frozen=True)
 class InferenceResult:
+    task: str
     input: str
     steps: int
     values: torch.Tensor
@@ -182,6 +194,7 @@ def infer(
     geometry: GeometryConfig,
     input_symbols: str,
     *,
+    task_name: str,
     steps: int,
     output_mode: str = "single",
 ) -> InferenceResult:
@@ -189,9 +202,12 @@ def infer(
         raise ValueError("steps must be a non-negative integer")
     if output_mode not in {"single", "multiple"}:
         raise ValueError("output_mode must be 'single' or 'multiple'")
+    if geometry != model.geometry:
+        raise ValueError("inference geometry differs from the fixed model geometry")
     layout = TapeLayout(geometry)
     encoded = encode_strings((input_symbols,), geometry.tape_slots).to(model.device)
-    initial = model.initial_state(layout.render_tape(encoded))
+    task_indices = torch.tensor([model.task_index(task_name)], device=model.device)
+    initial = model.initial_state(layout.render_tape(encoded), task_indices)
     was_training = model.training
     model.eval()
     try:
@@ -200,11 +216,75 @@ def infer(
     finally:
         model.train(was_training)
     return InferenceResult(
+        task=task_name,
         input=input_symbols,
         steps=steps,
         values=values,
         interpreted=interpret_tape(values, output_mode),
     )
+
+
+@torch.no_grad()
+def evaluate_tasks(
+    model: NeuralCellularAutomaton,
+    geometry: GeometryConfig,
+    datasets: MultiTaskDataset,
+    **kwargs,
+) -> list[EvaluationResult]:
+    if datasets.task_names != model.task_names:
+        raise ValueError("evaluation task order differs from the model")
+    results = [
+        evaluate(model, geometry, dataset, **kwargs) for dataset in datasets.datasets
+    ]
+    curves = (
+        "mse_by_step",
+        "semantic_by_step",
+        "raw_by_step",
+        "symbol_by_step",
+    )
+    averaged = {
+        name: tuple(
+            sum(values) / len(values)
+            for values in zip(*(getattr(result, name) for result in results))
+        )
+        for name in curves
+    }
+    window = slice(results[0].step_start, results[0].step_end + 1)
+    mse_window = averaged["mse_by_step"][window]
+    semantic_window = averaged["semantic_by_step"][window]
+    best_mse_offset = min(range(len(mse_window)), key=mse_window.__getitem__)
+    best_semantic_offset = max(
+        range(len(semantic_window)), key=semantic_window.__getitem__
+    )
+    aggregate = EvaluationResult(
+        task="aggregate",
+        examples=sum(result.examples for result in results),
+        total_examples=sum(result.total_examples for result in results),
+        tape_slots=geometry.tape_slots,
+        batch_size=results[0].batch_size,
+        seed=results[0].seed,
+        step_start=results[0].step_start,
+        step_end=results[0].step_end,
+        mean_mse=sum(result.mean_mse for result in results) / len(results),
+        mean_semantic_accuracy=sum(result.mean_semantic_accuracy for result in results)
+        / len(results),
+        mean_raw_accuracy=sum(result.mean_raw_accuracy for result in results)
+        / len(results),
+        mean_symbol_accuracy=sum(result.mean_symbol_accuracy for result in results)
+        / len(results),
+        stable_semantic_accuracy=sum(
+            result.stable_semantic_accuracy for result in results
+        )
+        / len(results),
+        stable_raw_accuracy=sum(result.stable_raw_accuracy for result in results)
+        / len(results),
+        best_semantic_step=results[0].step_start + best_semantic_offset,
+        best_semantic_accuracy=semantic_window[best_semantic_offset],
+        best_mse_step=results[0].step_start + best_mse_offset,
+        best_mse=mse_window[best_mse_offset],
+        **averaged,
+    )
+    return [*results, aggregate]
 
 
 def format_results(results: list[EvaluationResult]) -> str:

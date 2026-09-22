@@ -84,9 +84,8 @@ def reverse_task(max_length: int, *, include_shorter: bool = True) -> StringTask
         include_shorter=include_shorter,
         include_empty=include_shorter,
     )
-    scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
-        name=f"reverse-{scope}",
+        name="reverse",
         examples=tuple(StringExample(value, value[::-1]) for value in strings),
     )
 
@@ -97,9 +96,8 @@ def bitwise_not_task(max_length: int, *, include_shorter: bool = True) -> String
         include_shorter=include_shorter,
         include_empty=include_shorter,
     )
-    scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
-        name=f"bit-not-{scope}",
+        name="bit_not",
         examples=tuple(
             StringExample(
                 value,
@@ -116,13 +114,74 @@ def parity_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
         include_shorter=include_shorter,
         include_empty=include_shorter,
     )
-    scope = f"up-to-{max_length}" if include_shorter else str(max_length)
     return StringTask(
-        name=f"parity-{scope}",
+        name="parity",
         examples=tuple(
             StringExample(value, "1" if value.count("1") % 2 else "0")
             for value in strings
         ),
+    )
+
+
+def copy_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    strings = binary_strings(
+        max_length,
+        include_shorter=include_shorter,
+        include_empty=include_shorter,
+    )
+    return StringTask(
+        name="copy",
+        examples=tuple(StringExample(value, value) for value in strings),
+    )
+
+
+def append_task(
+    max_length: int, bit: str, *, include_shorter: bool = True
+) -> StringTask:
+    if bit not in {"0", "1"}:
+        raise ValueError("appended bit must be '0' or '1'")
+    strings = binary_strings(
+        max_length,
+        include_shorter=include_shorter,
+        include_empty=include_shorter,
+    )
+    return StringTask(
+        name=f"append_{bit}",
+        examples=tuple(StringExample(value, value + bit) for value in strings),
+    )
+
+
+def append_zero_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    return append_task(max_length, "0", include_shorter=include_shorter)
+
+
+def append_one_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    return append_task(max_length, "1", include_shorter=include_shorter)
+
+
+TASK_FACTORIES = {
+    "copy": copy_task,
+    "bit_not": bitwise_not_task,
+    "reverse": reverse_task,
+    "parity": parity_task,
+    "append_0": append_zero_task,
+    "append_1": append_one_task,
+}
+
+
+def binary_tasks(
+    names: tuple[str, ...], max_length: int, *, include_shorter: bool = True
+) -> tuple[StringTask, ...]:
+    if not names or any(not isinstance(name, str) for name in names):
+        raise ValueError("task names must be non-empty strings")
+    if len(set(names)) != len(names):
+        raise ValueError("task names must be non-empty and unique")
+    unknown = set(names) - set(TASK_FACTORIES)
+    if unknown:
+        raise ValueError(f"unknown tasks: {sorted(unknown)}")
+    return tuple(
+        TASK_FACTORIES[name](max_length, include_shorter=include_shorter)
+        for name in names
     )
 
 
@@ -204,6 +263,67 @@ class TaskDataset:
             raise ValueError("batch_size must be positive")
         indices = torch.randint(len(self), (batch_size,), generator=generator)
         return self.take(indices)
+
+
+@dataclass(frozen=True)
+class MultiTaskDataset:
+    datasets: tuple[TaskDataset, ...]
+
+    @classmethod
+    def from_tasks(
+        cls, tasks: tuple[StringTask, ...], tape_slots: int
+    ) -> "MultiTaskDataset":
+        return cls(tuple(TaskDataset.from_task(task, tape_slots) for task in tasks))
+
+    def __post_init__(self) -> None:
+        if not self.datasets:
+            raise ValueError("at least one task dataset is required")
+        if len(set(self.task_names)) != len(self.datasets):
+            raise ValueError("task dataset names must be unique")
+        first = self.datasets[0]
+        for dataset in self.datasets[1:]:
+            if dataset.tape_slots != first.tape_slots:
+                raise ValueError("all tasks must use the same tape capacity")
+            if dataset.input_strings != first.input_strings:
+                raise ValueError("all tasks must use the same ordered inputs")
+
+    @property
+    def task_names(self) -> tuple[str, ...]:
+        return tuple(dataset.name for dataset in self.datasets)
+
+    @property
+    def tape_slots(self) -> int:
+        return self.datasets[0].tape_slots
+
+    @property
+    def signatures(self) -> tuple[str, ...]:
+        return tuple(dataset.signature for dataset in self.datasets)
+
+    def __len__(self) -> int:
+        return sum(map(len, self.datasets))
+
+    def __getitem__(self, task_name: str) -> TaskDataset:
+        try:
+            index = self.task_names.index(task_name)
+        except ValueError as error:
+            raise KeyError(task_name) from error
+        return self.datasets[index]
+
+    def balanced_sample(
+        self, batch_size_per_task: int, generator: torch.Generator
+    ) -> tuple[torch.Tensor, ...]:
+        if type(batch_size_per_task) is not int or batch_size_per_task < 1:
+            raise ValueError("batch_size_per_task must be a positive integer")
+        batches = []
+        for task_index, dataset in enumerate(self.datasets):
+            inputs, targets, lengths = dataset.sample(batch_size_per_task, generator)
+            task_indices = torch.full(
+                (batch_size_per_task,), task_index, dtype=torch.int64
+            )
+            batches.append((inputs, targets, lengths, task_indices))
+        combined = tuple(torch.cat(parts) for parts in zip(*batches))
+        permutation = torch.randperm(combined[0].shape[0], generator=generator)
+        return tuple(value[permutation] for value in combined)
 
 
 def semantic_correct(

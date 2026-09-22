@@ -60,6 +60,7 @@ def test_save_gif_writes_every_output_frame(tmp_path):
         tmp_path / "evolution.gif",
         layout=layout,
         config=config,
+        task_name="copy",
         input_symbols="1B0",
         target_symbols="0",
         duration_ms=20,
@@ -74,6 +75,7 @@ def test_save_gif_writes_every_output_frame(tmp_path):
             tmp_path / "invalid.gif",
             layout=layout,
             config=config,
+            task_name="copy",
             input_symbols="1111",
             target_symbols="0",
         )

@@ -4,7 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .config import ModelConfig
+from .config import GeometryConfig, ModelConfig
+from .tape import TapeLayout
 
 
 def perception_kernel(name: str, random_seed: int = 0) -> torch.Tensor:
@@ -113,15 +114,45 @@ class UpdateRule(nn.Module):
 
 
 class NeuralCellularAutomaton(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(
+        self,
+        config: ModelConfig,
+        geometry: GeometryConfig,
+        task_names: tuple[str, ...],
+    ):
         super().__init__()
         config.validate()
+        geometry.validate()
+        if not task_names or any(
+            not isinstance(name, str) or not name.strip() for name in task_names
+        ):
+            raise ValueError("task names must be non-empty strings")
+        if len(set(task_names)) != len(task_names):
+            raise ValueError("task names must be unique")
         self.config = config
+        self.geometry = geometry
+        self.task_names = tuple(task_names)
+        self.layout = TapeLayout(geometry)
+        program_shape = (
+            len(task_names),
+            config.program_channels,
+            self.layout.height,
+            self.layout.width,
+        )
+        if config.program_placement == "tape":
+            program_shape = (
+                len(task_names),
+                config.program_channels,
+                geometry.tape_slots,
+            )
+        self.programs = nn.Parameter(torch.empty(program_shape))
+        nn.init.normal_(self.programs, std=config.program_init_std)
         self.perception = Perception(config)
         self.rule = UpdateRule(config, config.channels * self.perception.kernel_count)
         update_mask = torch.ones(1, config.channels, 1, 1)
-        update_mask[:, : config.program_channels] = 0.0
-        if config.input_mode == "frozen":
+        if not config.program_mutable:
+            update_mask[:, : config.program_channels] = 0.0
+        if config.io_mode == "separate" and config.input_mode == "frozen":
             update_mask[:, config.input_channel] = 0.0
         self.register_buffer("update_mask", update_mask)
 
@@ -133,11 +164,49 @@ class NeuralCellularAutomaton(nn.Module):
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
 
-    def initial_state(self, input_grid: torch.Tensor) -> torch.Tensor:
+    @property
+    def shared_parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(
+            parameter
+            for name, parameter in self.named_parameters()
+            if name != "programs"
+        )
+
+    def task_index(self, task_name: str) -> int:
+        try:
+            return self.task_names.index(task_name)
+        except ValueError as error:
+            raise ValueError(f"unknown task: {task_name!r}") from error
+
+    def program_grid(self, task_indices: torch.Tensor) -> torch.Tensor:
+        task_indices = torch.as_tensor(
+            task_indices, dtype=torch.int64, device=self.programs.device
+        )
+        if task_indices.ndim != 1:
+            raise ValueError("task_indices must be one-dimensional")
+        if bool(((task_indices < 0) | (task_indices >= len(self.task_names))).any()):
+            raise ValueError("task index is out of range")
+        selected = self.programs[task_indices]
+        if self.config.program_placement == "tape":
+            selected = self.layout.render_tape(selected)
+        return selected
+
+    def initial_state(
+        self, input_grid: torch.Tensor, task_indices: torch.Tensor
+    ) -> torch.Tensor:
         if input_grid.ndim != 3:
             raise ValueError("input_grid must have shape (batch, height, width)")
         if not torch.is_floating_point(input_grid):
             raise ValueError("input_grid must be floating point")
+        if input_grid.shape[1:] != (self.layout.height, self.layout.width):
+            raise ValueError("input grid does not match the fixed model geometry")
+        if input_grid.device != self.device:
+            raise ValueError("input grid and model must be on the same device")
+        task_indices = torch.as_tensor(
+            task_indices, dtype=torch.int64, device=self.programs.device
+        )
+        if task_indices.ndim != 1 or task_indices.shape[0] != input_grid.shape[0]:
+            raise ValueError("one task index is required per input")
         state = torch.zeros(
             input_grid.shape[0],
             self.config.channels,
@@ -145,6 +214,9 @@ class NeuralCellularAutomaton(nn.Module):
             input_grid.shape[2],
             device=input_grid.device,
             dtype=input_grid.dtype,
+        )
+        state[:, : self.config.program_channels] = self.program_grid(task_indices).to(
+            dtype=input_grid.dtype
         )
         state[:, self.config.input_channel] = input_grid
         return state

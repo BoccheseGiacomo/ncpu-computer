@@ -12,10 +12,10 @@ import torch
 from .config import ExperimentConfig
 from .model import NeuralCellularAutomaton
 from .tape import TapeLayout, quantize
-from .tasks import TaskDataset, semantic_correct
+from .tasks import MultiTaskDataset, semantic_correct
 
 
-CHECKPOINT_FORMAT = 3
+CHECKPOINT_FORMAT = 4
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -31,6 +31,7 @@ def resolve_device(requested: str) -> torch.device:
 class LossComponents:
     total: torch.Tensor
     base: torch.Tensor
+    per_task: torch.Tensor
 
 
 def supervised_loss(
@@ -40,6 +41,8 @@ def supervised_loss(
     output_channel: int,
     free_steps: int,
     supervision_steps: int,
+    task_indices: torch.Tensor | None = None,
+    task_count: int | None = None,
 ) -> LossComponents:
     start = free_steps + 1
     end = start + supervision_steps
@@ -55,8 +58,31 @@ def supervised_loss(
         raise ValueError("target shape does not match rollout and tape layout")
     prediction = layout.extract_tape(rollout[:, start:end, output_channel])
     expected = target.to(prediction.device).unsqueeze(1)
-    base = (prediction - expected).square().mean()
-    return LossComponents(total=base, base=base)
+    per_example = (prediction - expected).square().mean(dim=(1, 2))
+
+    if task_indices is None:
+        if task_count is not None:
+            raise ValueError("task_count requires task_indices")
+        per_task = per_example.mean().reshape(1)
+    else:
+        task_indices = torch.as_tensor(
+            task_indices, dtype=torch.int64, device=prediction.device
+        )
+        if task_indices.shape != (rollout.shape[0],):
+            raise ValueError("task_indices must contain one index per example")
+        if type(task_count) is not int or task_count < 1:
+            raise ValueError("task_count must be a positive integer")
+        if bool(((task_indices < 0) | (task_indices >= task_count)).any()):
+            raise ValueError("task index is out of range")
+        per_task_values = []
+        for task_index in range(task_count):
+            selected = per_example[task_indices == task_index]
+            if selected.numel() == 0:
+                raise ValueError("every task must occur in a balanced batch")
+            per_task_values.append(selected.mean())
+        per_task = torch.stack(per_task_values)
+    base = per_task.mean()
+    return LossComponents(total=base, base=base, per_task=per_task)
 
 
 def cosine_learning_rate(config: ExperimentConfig, update: int) -> float:
@@ -102,29 +128,41 @@ class Trainer:
     def __init__(
         self,
         config: ExperimentConfig,
-        dataset: TaskDataset,
+        datasets: MultiTaskDataset,
         model: NeuralCellularAutomaton | None = None,
     ):
         config.validate()
-        if dataset.tape_slots != config.geometry.tape_slots:
-            raise ValueError("dataset and geometry have different tape capacities")
+        if datasets.tape_slots != config.geometry.tape_slots:
+            raise ValueError("datasets and geometry have different tape capacities")
         self.config = config
-        self.dataset = dataset
+        self.datasets = datasets
         self.device = resolve_device(config.training.device)
         random.seed(config.training.seed)
         torch.manual_seed(config.training.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.training.seed)
         self.model = (
-            NeuralCellularAutomaton(config.model) if model is None else model
+            NeuralCellularAutomaton(config.model, config.geometry, datasets.task_names)
+            if model is None
+            else model
         ).to(self.device)
-        if self.model.config != config.model:
+        if self.model.config != config.model or self.model.geometry != config.geometry:
             raise ValueError("model and experiment configurations differ")
+        if self.model.task_names != datasets.task_names:
+            raise ValueError("model and dataset task order differs")
         self.layout = TapeLayout(config.geometry)
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
+            [
+                {
+                    "params": self.model.shared_parameters,
+                    "weight_decay": config.training.weight_decay,
+                },
+                {
+                    "params": [self.model.programs],
+                    "weight_decay": config.training.program_weight_decay,
+                },
+            ],
             lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
         )
         self.data_generator = torch.Generator().manual_seed(config.training.seed)
         self.current_update = 0
@@ -133,11 +171,18 @@ class Trainer:
 
     def _prepare(
         self, batch: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs, targets, lengths = (value.to(self.device) for value in batch)
-        return self.layout.render_tape(inputs), targets, lengths
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        inputs, targets, lengths, task_indices = (
+            value.to(self.device) for value in batch
+        )
+        return self.layout.render_tape(inputs), targets, lengths, task_indices
 
-    def _loss(self, rollout: torch.Tensor, targets: torch.Tensor) -> LossComponents:
+    def _loss(
+        self,
+        rollout: torch.Tensor,
+        targets: torch.Tensor,
+        task_indices: torch.Tensor,
+    ) -> LossComponents:
         training = self.config.training
         return supervised_loss(
             rollout,
@@ -146,6 +191,8 @@ class Trainer:
             self.config.model.output_channel,
             training.free_steps,
             training.supervision_steps,
+            task_indices,
+            len(self.datasets.datasets),
         )
 
     def train_step(self) -> StepMetrics:
@@ -153,13 +200,15 @@ class Trainer:
         learning_rate = cosine_learning_rate(self.config, self.current_update)
         for group in self.optimizer.param_groups:
             group["lr"] = learning_rate
-        input_grid, targets, lengths = self._prepare(
-            self.dataset.sample(self.config.training.batch_size, self.data_generator)
+        batch = self.datasets.balanced_sample(
+            self.config.training.batch_size_per_task, self.data_generator
         )
+        input_grid, targets, lengths, task_indices = self._prepare(batch)
         rollout = self.model(
-            self.model.initial_state(input_grid), self.config.training.rollout_steps
+            self.model.initial_state(input_grid, task_indices),
+            self.config.training.rollout_steps,
         )
-        losses = self._loss(rollout, targets)
+        losses = self._loss(rollout, targets, task_indices)
         if not torch.isfinite(losses.total):
             raise FloatingPointError(
                 f"non-finite loss at update {self.current_update + 1}"
@@ -192,9 +241,15 @@ class Trainer:
             final = quantize(values)
             discrete_targets = targets.to(torch.int8)
             raw = (final == discrete_targets).all(dim=1)
-            semantic = semantic_correct(
-                final, discrete_targets, lengths, self.dataset.output_mode
-            )
+            semantic = torch.empty_like(raw)
+            for task_index, dataset in enumerate(self.datasets.datasets):
+                selected = task_indices == task_index
+                semantic[selected] = semantic_correct(
+                    final[selected],
+                    discrete_targets[selected],
+                    lengths[selected],
+                    dataset.output_mode,
+                )
         self.current_update += 1
         return StepMetrics(
             update=self.current_update,
@@ -210,31 +265,50 @@ class Trainer:
     def validation_loss(self) -> float:
         was_training = self.model.training
         self.model.eval()
-        loss_sum = 0.0
-        example_count = 0
+        task_losses = []
         devices = [self.device.index or 0] if self.device.type == "cuda" else []
         try:
             with torch.random.fork_rng(devices=devices):
                 torch.manual_seed(self.config.training.seed)
                 if self.device.type == "cuda":
                     torch.cuda.manual_seed_all(self.config.training.seed)
-                for offset in range(
-                    0, len(self.dataset), self.config.training.batch_size
-                ):
-                    end = min(
-                        offset + self.config.training.batch_size, len(self.dataset)
-                    )
-                    indices = torch.arange(offset, end)
-                    input_grid, targets, _ = self._prepare(self.dataset.take(indices))
-                    rollout = self.model(
-                        self.model.initial_state(input_grid),
-                        self.config.training.rollout_steps,
-                    )
-                    loss_sum += float(self._loss(rollout, targets).base) * len(indices)
-                    example_count += len(indices)
+                for task_index, dataset in enumerate(self.datasets.datasets):
+                    loss_sum = 0.0
+                    for offset in range(
+                        0, len(dataset), self.config.training.batch_size_per_task
+                    ):
+                        end = min(
+                            offset + self.config.training.batch_size_per_task,
+                            len(dataset),
+                        )
+                        indices = torch.arange(offset, end)
+                        inputs, targets, _ = (
+                            value.to(self.device) for value in dataset.take(indices)
+                        )
+                        task_indices = torch.full(
+                            (len(indices),),
+                            task_index,
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        input_grid = self.layout.render_tape(inputs)
+                        rollout = self.model(
+                            self.model.initial_state(input_grid, task_indices),
+                            self.config.training.rollout_steps,
+                        )
+                        loss = supervised_loss(
+                            rollout,
+                            targets,
+                            self.layout,
+                            self.config.model.output_channel,
+                            self.config.training.free_steps,
+                            self.config.training.supervision_steps,
+                        ).base
+                        loss_sum += float(loss) * len(indices)
+                    task_losses.append(loss_sum / len(dataset))
         finally:
             self.model.train(was_training)
-        return loss_sum / example_count
+        return sum(task_losses) / len(task_losses)
 
     def fit(
         self,
@@ -286,9 +360,8 @@ class Trainer:
         state = {
             "format_version": CHECKPOINT_FORMAT,
             "config": self.config.to_dict(),
-            "dataset_signature": self.dataset.signature,
-            "dataset_name": self.dataset.name,
-            "output_mode": self.dataset.output_mode,
+            "task_names": self.datasets.task_names,
+            "dataset_signatures": self.datasets.signatures,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "update": self.current_update,
@@ -313,21 +386,18 @@ class Trainer:
     def from_checkpoint(
         cls,
         path: str | Path,
-        dataset: TaskDataset,
+        datasets: MultiTaskDataset,
         device: str | None = None,
     ) -> "Trainer":
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if checkpoint.get("format_version") != CHECKPOINT_FORMAT:
-            raise ValueError("checkpoint uses an incompatible model representation")
-        if checkpoint.get("dataset_signature") != dataset.signature:
-            raise ValueError("checkpoint dataset does not match the supplied dataset")
+        _validate_checkpoint(checkpoint, datasets)
         config_data = checkpoint["config"]
         if device is not None:
             config_data = {
                 **config_data,
                 "training": {**config_data["training"], "device": device},
             }
-        trainer = cls(ExperimentConfig.from_dict(config_data), dataset)
+        trainer = cls(ExperimentConfig.from_dict(config_data), datasets)
         trainer.model.load_state_dict(checkpoint["model"], strict=True)
         trainer.optimizer.load_state_dict(checkpoint["optimizer"])
         trainer.current_update = int(checkpoint["update"])
@@ -341,15 +411,34 @@ class Trainer:
         return trainer
 
 
+def _validate_checkpoint(checkpoint: dict, datasets: MultiTaskDataset | None) -> None:
+    if checkpoint.get("format_version") != CHECKPOINT_FORMAT:
+        raise ValueError("checkpoint uses an incompatible model representation")
+    task_names = tuple(checkpoint.get("task_names", ()))
+    if not task_names:
+        raise ValueError("checkpoint does not define its ordered tasks")
+    signatures = tuple(checkpoint.get("dataset_signatures", ()))
+    if len(signatures) != len(task_names):
+        raise ValueError("checkpoint task signatures are incomplete")
+    if datasets is not None:
+        if task_names != datasets.task_names:
+            raise ValueError("checkpoint task order does not match the datasets")
+        if signatures != datasets.signatures:
+            raise ValueError("checkpoint datasets do not match the supplied datasets")
+
+
 def load_model(
-    path: str | Path, device: str = "auto"
+    path: str | Path,
+    device: str = "auto",
+    datasets: MultiTaskDataset | None = None,
 ) -> tuple[NeuralCellularAutomaton, ExperimentConfig, dict]:
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved, weights_only=False)
-    if checkpoint.get("format_version") != CHECKPOINT_FORMAT:
-        raise ValueError("checkpoint uses an incompatible model representation")
+    _validate_checkpoint(checkpoint, datasets)
     config = ExperimentConfig.from_dict(checkpoint["config"])
-    model = NeuralCellularAutomaton(config.model).to(resolved)
+    model = NeuralCellularAutomaton(
+        config.model, config.geometry, tuple(checkpoint["task_names"])
+    ).to(resolved)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
     return model, config, checkpoint
@@ -357,7 +446,7 @@ def load_model(
 
 def train_seeds(
     config: ExperimentConfig,
-    dataset: TaskDataset,
+    datasets: MultiTaskDataset,
     seeds: tuple[int, ...],
     checkpoint_dir: str | Path = "checkpoints",
     *,
@@ -384,12 +473,12 @@ def train_seeds(
         latest = seed_dir / "latest.pt"
         if resume and latest.is_file():
             trainer = Trainer.from_checkpoint(
-                latest, dataset, device=seed_config.training.device
+                latest, datasets, device=seed_config.training.device
             )
             if trainer.config != seed_config:
                 raise ValueError(f"seed {seed} checkpoint configuration does not match")
         else:
-            trainer = Trainer(seed_config, dataset)
+            trainer = Trainer(seed_config, datasets)
         history = trainer.fit(seed_dir, progress_every=progress_every)
         results.append(
             SeedResult(

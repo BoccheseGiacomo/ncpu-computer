@@ -25,6 +25,16 @@ def test_config_round_trip_and_channel_roles():
     assert config.model.input_channel == 2
     assert config.model.output_channel == 3
     assert config.model.channels == 8
+    shared = ModelConfig(
+        program_channels=2,
+        computation_channels=4,
+        io_mode="shared",
+        input_mode="mutable",
+    )
+    assert shared.input_channel == shared.output_channel == 2
+    assert shared.channels == 7
+    with pytest.raises(ValueError, match="shared I/O"):
+        replace(shared, input_mode="frozen").validate()
     with pytest.raises(ValueError, match="tape_slots"):
         replace(config.geometry, tape_slots=0).validate()
     with pytest.raises(TypeError, match="integers"):

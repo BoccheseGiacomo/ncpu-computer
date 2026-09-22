@@ -69,6 +69,7 @@ def save_gif(
     *,
     layout: TapeLayout,
     config: ExperimentConfig,
+    task_name: str,
     input_symbols: str,
     target_symbols: str,
     output_mode: str = "single",
@@ -81,6 +82,8 @@ def save_gif(
         raise ValueError("output_mode must be 'single' or 'multiple'")
     validate_symbols(input_symbols, allow_empty=True)
     validate_symbols(target_symbols, allow_empty=True)
+    if not task_name.strip():
+        raise ValueError("task_name cannot be empty")
     if len(input_symbols) > layout.config.tape_slots:
         raise ValueError("input exceeds the visualized tape")
     if len(target_symbols) > layout.config.tape_slots:
@@ -112,6 +115,7 @@ def save_gif(
             raw_tapes[step],
             layout,
             config,
+            task_name,
             input_symbols,
             target_symbols,
             output_mode,
@@ -138,6 +142,7 @@ def _annotate_frame(
     raw_tape: str,
     layout: TapeLayout,
     config: ExperimentConfig,
+    task_name: str,
     input_symbols: str,
     target_symbols: str,
     output_mode: str,
@@ -170,7 +175,7 @@ def _annotate_frame(
     draw.text((left, 60), f"Decoded: {decoded}", fill=foreground, font=font)
     draw.text(
         (left, 78),
-        f"Input: {input_symbols or '<empty>'}    "
+        f"Task: {task_name}    Input: {input_symbols or '<empty>'}    "
         f"Target: {target_symbols or '<empty>'}",
         fill=foreground,
         font=font,

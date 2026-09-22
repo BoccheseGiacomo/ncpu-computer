@@ -4,9 +4,14 @@ import torch
 from ncpu_computer.tasks import (
     StringExample,
     StringTask,
+    MultiTaskDataset,
     TaskDataset,
     addition_task,
+    append_one_task,
+    append_zero_task,
+    binary_tasks,
     bitwise_not_task,
+    copy_task,
     parity_task,
     reverse_task,
     semantic_correct,
@@ -39,6 +44,43 @@ def test_binary_tasks_include_empty_and_all_shorter_strings_in_order():
     parity = {example.input: example.target for example in parity_task(1).examples}
     assert parity == {"": "0", "0": "0", "1": "1"}
     assert len(addition_task(2).examples) == 16
+    assert copy_task(1).examples == (
+        StringExample("", ""),
+        StringExample("0", "0"),
+        StringExample("1", "1"),
+    )
+    assert append_zero_task(1).examples == (
+        StringExample("", "0"),
+        StringExample("0", "00"),
+        StringExample("1", "10"),
+    )
+    assert append_one_task(1).examples == (
+        StringExample("", "1"),
+        StringExample("0", "01"),
+        StringExample("1", "11"),
+    )
+
+
+def test_programmed_tasks_share_inputs_and_balanced_batches():
+    names = ("copy", "bit_not", "reverse", "parity", "append_0", "append_1")
+    tasks = binary_tasks(names, 2)
+    datasets = MultiTaskDataset.from_tasks(tasks, tape_slots=4)
+    assert datasets.task_names == names
+    assert all(
+        dataset.input_strings == datasets.datasets[0].input_strings
+        for dataset in datasets.datasets
+    )
+    batch = datasets.balanced_sample(3, torch.Generator().manual_seed(4))
+    inputs, targets, lengths, task_indices = batch
+    assert inputs.shape == targets.shape == (18, 4)
+    assert lengths.shape == task_indices.shape == (18,)
+    assert torch.bincount(task_indices, minlength=6).tolist() == [3] * 6
+    assert set(task_indices.tolist()) == set(range(6))
+
+
+def test_append_capacity_is_checked_without_automatic_expansion():
+    with pytest.raises(ValueError, match="output"):
+        TaskDataset.from_task(append_zero_task(3), tape_slots=3)
 
 
 def test_exact_length_tasks_exclude_empty_and_shorter_strings():

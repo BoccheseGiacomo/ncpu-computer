@@ -9,14 +9,28 @@ from ncpu_computer.config import (
     ModelConfig,
     TrainingConfig,
 )
-from ncpu_computer.evaluation import evaluate, infer
-from ncpu_computer.tasks import StringExample, StringTask, TaskDataset, reverse_task
+from ncpu_computer.evaluation import evaluate, evaluate_tasks, infer
+from ncpu_computer.tasks import (
+    MultiTaskDataset,
+    StringExample,
+    StringTask,
+    TaskDataset,
+    binary_tasks,
+)
 from ncpu_computer.training import Trainer, load_model, supervised_loss
 from ncpu_computer.validation import validate_experiment
 from ncpu_computer.tape import TapeLayout
 
 
-def tiny_setup(*, updates=2, fire_rate=1.0, input_mode="mutable"):
+def tiny_setup(
+    *,
+    updates=2,
+    fire_rate=1.0,
+    input_mode="mutable",
+    io_mode="separate",
+    program_placement="grid",
+    program_mutable=False,
+):
     geometry = GeometryConfig(
         tape_slots=3,
         stride=2,
@@ -33,11 +47,14 @@ def tiny_setup(*, updates=2, fire_rate=1.0, input_mode="mutable"):
             learnable_kernels=0,
             fire_rate=fire_rate,
             input_mode=input_mode,
+            io_mode=io_mode,
+            program_placement=program_placement,
+            program_mutable=program_mutable,
             max_abs_state=None,
         ),
         training=TrainingConfig(
             updates=updates,
-            batch_size=2,
+            batch_size_per_task=2,
             free_steps=0,
             supervision_steps=1,
             validation_every=1,
@@ -45,16 +62,15 @@ def tiny_setup(*, updates=2, fire_rate=1.0, input_mode="mutable"):
             device="cpu",
         ),
     )
-    task = StringTask(
-        "binary-not",
-        (StringExample("", ""), StringExample("0", "1"), StringExample("1", "0")),
+    datasets = MultiTaskDataset.from_tasks(
+        binary_tasks(("copy", "bit_not"), 1), geometry.tape_slots
     )
-    return config, TaskDataset.from_task(task, geometry.tape_slots)
+    return config, datasets
 
 
-def test_supervised_loss_uses_only_output_tape_and_requested_window():
+def test_supervised_loss_uses_full_output_tape_and_equal_task_means():
     geometry = GeometryConfig(
-        tape_slots=4,
+        tape_slots=2,
         stride=2,
         border_left=1,
         border_right=1,
@@ -62,33 +78,35 @@ def test_supervised_loss_uses_only_output_tape_and_requested_window():
         border_bottom=1,
     )
     layout = TapeLayout(geometry)
-    rollout = torch.zeros(1, 4, 4, layout.height, layout.width)
-    predicted = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    rollout[:, 2:4, 2, layout.tape_row, layout.tape_slice] = predicted
-    rollout[:, 2:4, 2, 0, 0] = 1000.0
-    rollout[:, 2:4, 1, layout.tape_row, layout.tape_slice] = 1000.0
+    rollout = torch.zeros(3, 2, 4, layout.height, layout.width)
+    rollout[0, 1, 2, layout.tape_row, layout.tape_slice] = 1.0
+    rollout[1:, 1, 2, layout.tape_row, layout.tape_slice] = 3.0
+    rollout[:, 1, 2, 0, 0] = 1000.0
+    rollout[:, 1, 1, layout.tape_row, layout.tape_slice] = 1000.0
     losses = supervised_loss(
         rollout,
-        torch.zeros(1, 4),
+        torch.zeros(3, 2),
         layout,
         output_channel=2,
-        free_steps=1,
-        supervision_steps=2,
+        free_steps=0,
+        supervision_steps=1,
+        task_indices=torch.tensor([0, 1, 1]),
+        task_count=2,
     )
-    assert float(losses.base) == pytest.approx(7.5)
-    assert float(losses.total) == pytest.approx(7.5)
+    assert losses.per_task.tolist() == pytest.approx([1.0, 9.0])
+    assert float(losses.base) == pytest.approx(5.0)
 
 
 def test_checkpoint_resume_matches_uninterrupted_training(tmp_path):
-    config, dataset = tiny_setup(fire_rate=0.5)
-    uninterrupted = Trainer(config, dataset)
+    config, datasets = tiny_setup(fire_rate=0.5)
+    uninterrupted = Trainer(config, datasets)
     uninterrupted.train_step()
     uninterrupted.train_step()
-    interrupted = Trainer(config, dataset)
+    interrupted = Trainer(config, datasets)
     interrupted.train_step()
     checkpoint = tmp_path / "resume.pt"
     interrupted.save(checkpoint)
-    resumed = Trainer.from_checkpoint(checkpoint, dataset, device="cpu")
+    resumed = Trainer.from_checkpoint(checkpoint, datasets, device="cpu")
     resumed.train_step()
     assert resumed.current_update == uninterrupted.current_update == 2
     for expected, actual in zip(
@@ -97,9 +115,16 @@ def test_checkpoint_resume_matches_uninterrupted_training(tmp_path):
         assert torch.equal(expected, actual)
 
 
-def test_training_step_changes_zero_initialized_rule():
-    config, dataset = tiny_setup()
-    trainer = Trainer(config, dataset)
+def test_training_step_is_balanced_and_optimizer_separates_program_decay():
+    config, datasets = tiny_setup()
+    trainer = Trainer(config, datasets)
+    assert trainer.optimizer.param_groups[0]["weight_decay"] == pytest.approx(
+        config.training.weight_decay
+    )
+    assert trainer.optimizer.param_groups[1]["weight_decay"] == pytest.approx(
+        config.training.program_weight_decay
+    )
+    assert trainer.optimizer.param_groups[1]["params"] == [trainer.model.programs]
     before = trainer.model.rule.output.weight.detach().clone()
     metrics = trainer.train_step()
     assert metrics.loss > 0
@@ -107,32 +132,45 @@ def test_training_step_changes_zero_initialized_rule():
 
 
 def test_exhaustive_validation_loss_is_independent_of_batch_partition():
-    config, dataset = tiny_setup()
+    config, datasets = tiny_setup()
     first = Trainer(
-        replace(config, training=replace(config.training, batch_size=1)), dataset
+        replace(config, training=replace(config.training, batch_size_per_task=1)),
+        datasets,
     )
     second = Trainer(
-        replace(config, training=replace(config.training, batch_size=len(dataset))),
-        dataset,
+        replace(config, training=replace(config.training, batch_size_per_task=3)),
+        datasets,
     )
     second.model.load_state_dict(first.model.state_dict())
     assert first.validation_loss() == pytest.approx(second.validation_loss())
     assert first.model.training
 
 
-def test_short_fit_writes_loadable_version_three_checkpoints(tmp_path):
-    config, dataset = tiny_setup(updates=1)
-    trainer = Trainer(config, dataset)
+def test_short_fit_writes_loadable_version_four_checkpoint(tmp_path):
+    config, datasets = tiny_setup(updates=1)
+    trainer = Trainer(config, datasets)
     history = trainer.fit(tmp_path, progress_every=1)
     assert len(history) == 1
-    model, loaded_config, checkpoint = load_model(tmp_path / "best.pt", "cpu")
+    model, loaded_config, checkpoint = load_model(tmp_path / "best.pt", "cpu", datasets)
     assert loaded_config == config
-    assert checkpoint["format_version"] == 3
-    assert checkpoint["dataset_signature"] == dataset.signature
+    assert checkpoint["format_version"] == 4
+    assert tuple(checkpoint["task_names"]) == datasets.task_names
+    assert tuple(checkpoint["dataset_signatures"]) == datasets.signatures
     assert not model.training
-    other_data = TaskDataset.from_task(reverse_task(2), config.geometry.tape_slots)
-    with pytest.raises(ValueError, match="dataset"):
-        Trainer.from_checkpoint(tmp_path / "best.pt", other_data, device="cpu")
+    reversed_order = MultiTaskDataset(tuple(reversed(datasets.datasets)))
+    with pytest.raises(ValueError, match="task order"):
+        Trainer.from_checkpoint(tmp_path / "best.pt", reversed_order, device="cpu")
+    different_examples = MultiTaskDataset.from_tasks(
+        binary_tasks(datasets.task_names, 2), config.geometry.tape_slots
+    )
+    with pytest.raises(ValueError, match="datasets"):
+        Trainer.from_checkpoint(tmp_path / "best.pt", different_examples, device="cpu")
+    incompatible = dict(checkpoint)
+    incompatible["format_version"] = 3
+    incompatible_path = tmp_path / "old.pt"
+    torch.save(incompatible, incompatible_path)
+    with pytest.raises(ValueError, match="incompatible"):
+        load_model(incompatible_path, "cpu")
 
 
 def test_zero_output_model_evaluates_empty_target_exactly():
@@ -141,7 +179,8 @@ def test_zero_output_model_evaluates_empty_target_exactly():
         StringTask("empty", (StringExample("101", ""),)),
         config.geometry.tape_slots,
     )
-    model = Trainer(config, dataset).model
+    datasets = MultiTaskDataset((dataset,))
+    model = Trainer(config, datasets).model
     result = evaluate(
         model,
         config.geometry,
@@ -156,19 +195,60 @@ def test_zero_output_model_evaluates_empty_target_exactly():
     assert result.mean_raw_accuracy == 1.0
 
 
-def test_inference_reads_the_separate_zero_output_channel():
-    config, _ = tiny_setup()
-    model = Trainer(config, TaskDataset.from_task(reverse_task(1), 3)).model
-    result = infer(model, config.geometry, "101", steps=0)
+def test_inference_requires_explicit_task_and_reads_configured_channel():
+    config, datasets = tiny_setup()
+    model = Trainer(config, datasets).model
+    result = infer(model, config.geometry, "101", task_name="copy", steps=0)
+    assert result.task == "copy"
     assert result.values.tolist() == [0.0, 0.0, 0.0]
     assert result.interpreted.raw == "BBB"
-    assert result.interpreted.binary_strings == ("",)
+    shared_config, shared_datasets = tiny_setup(io_mode="shared")
+    shared = Trainer(shared_config, shared_datasets).model
+    shared_result = infer(
+        shared, shared_config.geometry, "101", task_name="copy", steps=0
+    )
+    assert shared_result.values.tolist() == [1.0, -1.0, 1.0]
 
 
-def test_validation_covers_core_invariants_for_both_input_modes():
-    for mode in ("mutable", "frozen"):
-        config, dataset = tiny_setup(input_mode=mode)
-        report = validate_experiment(config, dataset)
-        assert "direct input and zero output initialization" in report.checks
-        assert "full-tape MSE and gradients" in report.checks
-        assert report.examples == len(dataset)
+def test_evaluate_tasks_returns_each_task_and_equal_aggregate():
+    config, datasets = tiny_setup()
+    model = Trainer(config, datasets).model
+    results = evaluate_tasks(
+        model,
+        config.geometry,
+        datasets,
+        steps=1,
+        step_start=0,
+        step_end=1,
+        batch_size=2,
+    )
+    assert [result.task for result in results] == ["copy", "bit_not", "aggregate"]
+    assert results[-1].mean_mse == pytest.approx(
+        sum(result.mean_mse for result in results[:-1]) / 2
+    )
+    with pytest.raises(ValueError, match="fixed model geometry"):
+        evaluate(
+            model,
+            replace(config.geometry, tape_slots=4),
+            datasets.datasets[0],
+            steps=1,
+            step_start=0,
+            step_end=1,
+        )
+
+
+@pytest.mark.parametrize("program_placement", ["grid", "tape"])
+@pytest.mark.parametrize(
+    "io_mode,input_mode",
+    [("separate", "mutable"), ("separate", "frozen"), ("shared", "mutable")],
+)
+def test_validation_covers_program_and_io_modes(program_placement, io_mode, input_mode):
+    config, datasets = tiny_setup(
+        input_mode=input_mode,
+        io_mode=io_mode,
+        program_placement=program_placement,
+    )
+    report = validate_experiment(config, datasets)
+    assert "task-indexed program and I/O initialization" in report.checks
+    assert "balanced full-tape MSE and gradients" in report.checks
+    assert report.examples == len(datasets)

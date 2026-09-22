@@ -41,7 +41,11 @@ class GeometryConfig:
 class ModelConfig:
     program_channels: int = 1
     computation_channels: int = 3
+    io_mode: str = "separate"
     input_mode: str = "mutable"
+    program_placement: str = "grid"
+    program_mutable: bool = False
+    program_init_std: float = 0.02
     hidden_size: int = 96
     fixed_kernels: tuple[str, ...] = ("identity", "sobel_x", "sobel_y")
     fixed_laplacian: bool = False
@@ -60,11 +64,12 @@ class ModelConfig:
 
     @property
     def output_channel(self) -> int:
-        return self.program_channels + 1
+        return self.program_channels + (1 if self.io_mode == "separate" else 0)
 
     @property
     def channels(self) -> int:
-        return self.program_channels + 2 + self.computation_channels
+        io_channels = 2 if self.io_mode == "separate" else 1
+        return self.program_channels + io_channels + self.computation_channels
 
     def validate(self) -> None:
         integers = (
@@ -80,17 +85,27 @@ class ModelConfig:
             raise ValueError("program_channels must be positive")
         if self.computation_channels < 0:
             raise ValueError("computation_channels cannot be negative")
+        if self.io_mode not in {"separate", "shared"}:
+            raise ValueError("io_mode must be 'separate' or 'shared'")
         if self.input_mode not in {"mutable", "frozen"}:
             raise ValueError("input_mode must be 'mutable' or 'frozen'")
+        if self.io_mode == "shared" and self.input_mode == "frozen":
+            raise ValueError("shared I/O must be mutable")
+        if self.program_placement not in {"grid", "tape"}:
+            raise ValueError("program_placement must be 'grid' or 'tape'")
+        if type(self.program_mutable) is not bool:
+            raise TypeError("program_mutable must be a boolean")
         if self.hidden_size < 1:
             raise ValueError("hidden_size must be positive")
         if self.random_kernel_seed < 0:
             raise ValueError("random_kernel_seed cannot be negative")
-        numeric = (self.gate_bias, self.fire_rate)
+        numeric = (self.program_init_std, self.gate_bias, self.fire_rate)
         if self.max_abs_state is not None:
             numeric += (self.max_abs_state,)
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("model scalar hyperparameters must be finite")
+        if self.program_init_std < 0:
+            raise ValueError("program_init_std cannot be negative")
         if (
             not self.fixed_kernels
             and not self.fixed_laplacian
@@ -119,13 +134,14 @@ class ModelConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     updates: int = 3000
-    batch_size: int = 256
+    batch_size_per_task: int = 64
     free_steps: int = 60
     supervision_steps: int = 140
     learning_rate: float = 2e-3
     final_learning_rate: float = 1e-4
     warmup_updates: int = 0
     weight_decay: float = 2e-5
+    program_weight_decay: float = 1e-4
     grad_clip: float | None = 0.8
     seed: int = 0
     validation_every: int = 50
@@ -147,7 +163,7 @@ class TrainingConfig:
     def validate(self) -> None:
         integers = (
             self.updates,
-            self.batch_size,
+            self.batch_size_per_task,
             self.free_steps,
             self.supervision_steps,
             self.warmup_updates,
@@ -163,13 +179,14 @@ class TrainingConfig:
             self.learning_rate,
             self.final_learning_rate,
             self.weight_decay,
+            self.program_weight_decay,
         )
         if self.grad_clip is not None:
             numeric += (self.grad_clip,)
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("training scalar hyperparameters must be finite")
-        if self.updates < 1 or self.batch_size < 1:
-            raise ValueError("updates and batch_size must be positive")
+        if self.updates < 1 or self.batch_size_per_task < 1:
+            raise ValueError("updates and batch_size_per_task must be positive")
         if self.free_steps < 0 or self.supervision_steps < 1:
             raise ValueError(
                 "free_steps must be non-negative and supervision_steps positive"
@@ -178,8 +195,8 @@ class TrainingConfig:
             raise ValueError("learning rates must be positive")
         if not 0 <= self.warmup_updates < self.updates:
             raise ValueError("warmup_updates must be in [0, updates)")
-        if self.weight_decay < 0:
-            raise ValueError("weight_decay cannot be negative")
+        if self.weight_decay < 0 or self.program_weight_decay < 0:
+            raise ValueError("weight decays cannot be negative")
         if self.grad_clip is not None and self.grad_clip <= 0:
             raise ValueError("grad_clip must be positive or None")
         if self.validation_every < 1 or self.checkpoint_every < 1:

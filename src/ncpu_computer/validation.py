@@ -7,8 +7,11 @@ import torch
 from .config import ExperimentConfig
 from .model import NeuralCellularAutomaton
 from .tape import TERNARY_THRESHOLD, TapeLayout, quantize
-from .tasks import TaskDataset, bitwise_not_task
+from .tasks import MultiTaskDataset, binary_tasks
 from .training import supervised_loss
+
+
+DEFAULT_TASKS = ("copy", "bit_not", "reverse", "parity", "append_0", "append_1")
 
 
 @dataclass(frozen=True)
@@ -30,20 +33,23 @@ class ValidationReport:
 
 def validate_experiment(
     config: ExperimentConfig,
-    dataset: TaskDataset | None = None,
+    datasets: MultiTaskDataset | None = None,
 ) -> ValidationReport:
     config.validate()
-    if dataset is None:
-        dataset = TaskDataset.from_task(
-            bitwise_not_task(config.geometry.tape_slots),
-            config.geometry.tape_slots,
+    if datasets is None:
+        max_length = min(2, config.geometry.tape_slots - 1)
+        if max_length < 1:
+            raise ValueError("default programmed tasks require at least two tape slots")
+        datasets = MultiTaskDataset.from_tasks(
+            binary_tasks(DEFAULT_TASKS, max_length), config.geometry.tape_slots
         )
-    if dataset.tape_slots != config.geometry.tape_slots:
-        raise ValueError("dataset and geometry have different tape capacities")
+    if datasets.tape_slots != config.geometry.tape_slots:
+        raise ValueError("datasets and geometry have different tape capacities")
     layout = TapeLayout(config.geometry)
     checks = []
 
-    sample = dataset.inputs[: min(3, len(dataset))]
+    sample_count = min(3, len(datasets.datasets[0]), len(datasets.datasets))
+    sample = datasets.datasets[0].inputs[:sample_count]
     rendered = layout.render_tape(sample)
     if not torch.equal(layout.extract_tape(rendered), sample):
         raise AssertionError("tape render/extract round trip failed")
@@ -67,43 +73,66 @@ def validate_experiment(
     checks.append("direct ternary codec")
 
     torch.manual_seed(config.training.seed)
-    model = NeuralCellularAutomaton(config.model)
-    initial = model.initial_state(rendered)
-    if torch.count_nonzero(initial[:, config.model.output_channel]) != 0:
-        raise AssertionError("output channel is not zero at initialization")
+    model = NeuralCellularAutomaton(config.model, config.geometry, datasets.task_names)
+    task_indices = torch.arange(sample_count)
+    initial = model.initial_state(rendered, task_indices)
+    expected_programs = model.program_grid(task_indices)
+    if not torch.equal(initial[:, : config.model.program_channels], expected_programs):
+        raise AssertionError("selected programs were not injected")
+    if config.model.program_placement == "tape" and bool(
+        (expected_programs[:, :, ~occupied] != 0).any()
+    ):
+        raise AssertionError("tape programs wrote outside logical positions")
     if not torch.equal(initial[:, config.model.input_channel], rendered):
         raise AssertionError("input tape was not injected directly")
+    if config.model.io_mode == "separate" and torch.count_nonzero(
+        initial[:, config.model.output_channel]
+    ):
+        raise AssertionError("separate output channel is not zero initially")
     if not torch.equal(model(initial, 1)[:, 1], initial):
         raise AssertionError("zero-initialized update rule is not identity")
-    checks.append("direct input and zero output initialization")
+    checks.append("task-indexed program and I/O initialization")
 
-    probe = NeuralCellularAutomaton(config.model)
+    probe = NeuralCellularAutomaton(config.model, config.geometry, datasets.task_names)
     with torch.no_grad():
         probe.rule.output.weight.fill_(0.05)
         if probe.rule.output.bias is not None:
             probe.rule.output.bias.fill_(0.05)
-    state = probe.initial_state(rendered)
+    state = probe.initial_state(rendered, task_indices)
     updated = probe.step(state)
     program = slice(0, config.model.program_channels)
-    if not torch.equal(updated[:, program], state[:, program]):
-        raise AssertionError("frozen program channels changed during an update")
-    if config.model.input_mode == "frozen" and not torch.equal(
-        updated[:, config.model.input_channel], state[:, config.model.input_channel]
+    if not config.model.program_mutable and not torch.equal(
+        updated[:, program], state[:, program]
     ):
-        raise AssertionError("frozen input channel changed during an update")
+        raise AssertionError("read-only program changed during an update")
+    if config.model.io_mode == "separate" and config.model.input_mode == "frozen":
+        if not torch.equal(
+            updated[:, config.model.input_channel], state[:, config.model.input_channel]
+        ):
+            raise AssertionError("frozen input changed during an update")
     if float(probe.update_mask[0, config.model.output_channel, 0, 0]) != 1.0:
-        raise AssertionError("output channel is not mutable")
+        raise AssertionError("readout channel is not mutable")
     checks.append("channel mutability")
 
-    inputs = torch.zeros(1, config.geometry.tape_slots)
-    inputs[0, 0] = 1.0
-    targets = torch.zeros_like(inputs)
-    targets[0, 0] = -1.0
-    train_model = NeuralCellularAutomaton(config.model)
+    train_model = NeuralCellularAutomaton(
+        config.model, config.geometry, datasets.task_names
+    )
     with torch.no_grad():
         train_model.rule.hidden.weight.fill_(0.1)
         train_model.rule.hidden.bias.fill_(0.1)
-    rollout = train_model(train_model.initial_state(layout.render_tape(inputs)), 1)
+        train_model.rule.output.weight.fill_(0.01)
+        if train_model.rule.output.bias is not None:
+            train_model.rule.output.bias.zero_()
+    inputs = torch.stack(
+        [dataset.inputs[min(2, len(dataset) - 1)] for dataset in datasets.datasets]
+    )
+    targets = torch.stack(
+        [dataset.targets[min(2, len(dataset) - 1)] for dataset in datasets.datasets]
+    )
+    all_tasks = torch.arange(len(datasets.datasets))
+    rollout = train_model(
+        train_model.initial_state(layout.render_tape(inputs), all_tasks), 1
+    )
     loss = supervised_loss(
         rollout,
         targets,
@@ -111,25 +140,24 @@ def validate_experiment(
         config.model.output_channel,
         free_steps=0,
         supervision_steps=1,
+        task_indices=all_tasks,
+        task_count=len(datasets.datasets),
     )
     loss.total.backward()
-    gradients = [
-        parameter.grad
-        for parameter in train_model.parameters()
-        if parameter.grad is not None
-    ]
-    if not gradients or not all(
-        torch.isfinite(gradient).all() for gradient in gradients
+    if train_model.rule.output.weight.grad is None or not bool(
+        (train_model.rule.output.weight.grad != 0).any()
     ):
-        raise AssertionError("finite gradients did not reach the model")
-    rule_gradient = train_model.rule.output.weight.grad
-    if rule_gradient is None or not bool((rule_gradient != 0).any()):
-        raise AssertionError("loss produced no learning signal for the local rule")
-    checks.append("full-tape MSE and gradients")
+        raise AssertionError("loss produced no learning signal for the shared rule")
+    program_gradient = train_model.programs.grad
+    if program_gradient is None or not bool(
+        (program_gradient.flatten(1).abs().sum(dim=1) > 0).all()
+    ):
+        raise AssertionError("loss did not reach every task program")
+    checks.append("balanced full-tape MSE and gradients")
 
     return ValidationReport(
         checks=tuple(checks),
         parameter_count=model.parameter_count,
         grid_shape=(layout.height, layout.width),
-        examples=len(dataset),
+        examples=len(datasets),
     )
