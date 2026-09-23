@@ -45,13 +45,15 @@ def validate_experiment(
 
     sample = dataset.inputs[: min(3, len(dataset))]
     rendered = layout.render_tape(sample)
-    if not torch.equal(layout.extract_tape(rendered), sample):
+    if not torch.equal(layout.extract_tape(rendered, "input"), sample):
         raise AssertionError("tape render/extract round trip failed")
+    if torch.count_nonzero(layout.extract_tape(rendered)):
+        raise AssertionError("output lane is not initially blank")
     occupied = torch.zeros(layout.height, layout.width, dtype=torch.bool)
-    occupied[layout.tape_row, layout.tape_slice] = True
+    occupied[layout.input_row, layout.tape_slice] = True
     if bool((rendered[:, ~occupied] != 0).any()):
         raise AssertionError("tape rendering wrote outside logical positions")
-    checks.append("strided tape geometry")
+    checks.append("aligned strided two-lane geometry")
 
     values = torch.tensor(
         [
@@ -69,13 +71,11 @@ def validate_experiment(
     torch.manual_seed(config.training.seed)
     model = NeuralCellularAutomaton(config.model)
     initial = model.initial_state(rendered)
-    if torch.count_nonzero(initial[:, config.model.output_channel]) != 0:
-        raise AssertionError("output channel is not zero at initialization")
-    if not torch.equal(initial[:, config.model.input_channel], rendered):
+    if not torch.equal(initial[:, config.model.io_channel], rendered):
         raise AssertionError("input tape was not injected directly")
     if not torch.equal(model(initial, 1)[:, 1], initial):
         raise AssertionError("zero-initialized update rule is not identity")
-    checks.append("direct input and zero output initialization")
+    checks.append("direct input and zero output-lane initialization")
 
     probe = NeuralCellularAutomaton(config.model)
     with torch.no_grad():
@@ -87,12 +87,8 @@ def validate_experiment(
     program = slice(0, config.model.program_channels)
     if not torch.equal(updated[:, program], state[:, program]):
         raise AssertionError("frozen program channels changed during an update")
-    if config.model.input_mode == "frozen" and not torch.equal(
-        updated[:, config.model.input_channel], state[:, config.model.input_channel]
-    ):
-        raise AssertionError("frozen input channel changed during an update")
-    if float(probe.update_mask[0, config.model.output_channel, 0, 0]) != 1.0:
-        raise AssertionError("output channel is not mutable")
+    if float(probe.update_mask[0, config.model.io_channel, 0, 0]) != 1.0:
+        raise AssertionError("I/O channel is not mutable")
     checks.append("channel mutability")
 
     inputs = torch.zeros(1, config.geometry.tape_slots)
@@ -108,7 +104,7 @@ def validate_experiment(
         rollout,
         targets,
         layout,
-        config.model.output_channel,
+        config.model.io_channel,
         free_steps=0,
         supervision_steps=1,
     )

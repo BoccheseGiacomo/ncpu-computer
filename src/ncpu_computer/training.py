@@ -15,7 +15,7 @@ from .tape import TapeLayout, quantize
 from .tasks import TaskDataset, semantic_correct
 
 
-CHECKPOINT_FORMAT = 3
+CHECKPOINT_FORMAT = 4
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -37,7 +37,7 @@ def supervised_loss(
     rollout: torch.Tensor,
     target: torch.Tensor,
     layout: TapeLayout,
-    output_channel: int,
+    io_channel: int,
     free_steps: int,
     supervision_steps: int,
 ) -> LossComponents:
@@ -47,13 +47,13 @@ def supervised_loss(
         raise ValueError(
             "rollout must have shape (batch, time, channels, height, width)"
         )
-    if not 0 <= output_channel < rollout.shape[2]:
-        raise ValueError("output_channel does not exist in rollout")
+    if not 0 <= io_channel < rollout.shape[2]:
+        raise ValueError("io_channel does not exist in rollout")
     if start < 1 or end > rollout.shape[1]:
         raise ValueError("rollout does not cover the supervision window")
     if target.shape != (rollout.shape[0], layout.config.tape_slots):
         raise ValueError("target shape does not match rollout and tape layout")
-    prediction = layout.extract_tape(rollout[:, start:end, output_channel])
+    prediction = layout.extract_tape(rollout[:, start:end, io_channel])
     expected = target.to(prediction.device).unsqueeze(1)
     base = (prediction - expected).square().mean()
     return LossComponents(total=base, base=base)
@@ -143,7 +143,7 @@ class Trainer:
             rollout,
             targets,
             self.layout,
-            self.config.model.output_channel,
+            self.config.model.io_channel,
             training.free_steps,
             training.supervision_steps,
         )
@@ -187,7 +187,7 @@ class Trainer:
 
         with torch.no_grad():
             values = self.layout.extract_tape(
-                rollout[:, -1, self.config.model.output_channel]
+                rollout[:, -1, self.config.model.io_channel]
             )
             final = quantize(values)
             discrete_targets = targets.to(torch.int8)

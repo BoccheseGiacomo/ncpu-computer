@@ -34,6 +34,7 @@ class Perception(nn.Module):
         super().__init__()
         self.channels = config.channels
         self.padding = config.padding
+        self.wrap_y = config.wrap_y
         fixed_names = list(config.fixed_kernels)
         if config.fixed_laplacian:
             fixed_names.append("laplacian")
@@ -69,7 +70,12 @@ class Perception(nn.Module):
             .reshape(self.channels * self.kernel_count, 1, 3, 3)
         )
         padding_mode = "constant" if self.padding == "zeros" else self.padding
-        padded = F.pad(state, (1, 1, 1, 1), mode=padding_mode)
+        padded = F.pad(state, (1, 1, 0, 0), mode=padding_mode)
+        padded = F.pad(
+            padded,
+            (0, 0, 1, 1),
+            mode="circular" if self.wrap_y else padding_mode,
+        )
         return F.conv2d(padded, filters, groups=self.channels)
 
 
@@ -121,8 +127,6 @@ class NeuralCellularAutomaton(nn.Module):
         self.rule = UpdateRule(config, config.channels * self.perception.kernel_count)
         update_mask = torch.ones(1, config.channels, 1, 1)
         update_mask[:, : config.program_channels] = 0.0
-        if config.input_mode == "frozen":
-            update_mask[:, config.input_channel] = 0.0
         self.register_buffer("update_mask", update_mask)
 
     @property
@@ -146,7 +150,7 @@ class NeuralCellularAutomaton(nn.Module):
             device=input_grid.device,
             dtype=input_grid.dtype,
         )
-        state[:, self.config.input_channel] = input_grid
+        state[:, self.config.io_channel] = input_grid
         return state
 
     def step(self, state: torch.Tensor) -> torch.Tensor:

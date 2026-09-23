@@ -116,7 +116,7 @@ def evaluate(
                     value.to(device) for value in dataset.take(batch_indices)
                 )
                 rollout = model(model.initial_state(layout.render_tape(inputs)), steps)
-                values = layout.extract_tape(rollout[:, :, model.config.output_channel])
+                values = layout.extract_tape(rollout[:, :, model.config.io_channel])
                 expected = targets.unsqueeze(1)
                 discrete = quantize(values)
                 discrete_targets = targets.to(torch.int8)
@@ -195,7 +195,7 @@ def infer(
     was_training = model.training
     model.eval()
     try:
-        final = model(initial, steps)[:, -1, model.config.output_channel]
+        final = model(initial, steps)[:, -1, model.config.io_channel]
         values = layout.extract_tape(final)[0].cpu()
     finally:
         model.train(was_training)

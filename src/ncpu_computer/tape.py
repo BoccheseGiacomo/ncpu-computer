@@ -129,7 +129,12 @@ class TapeLayout:
 
     @property
     def height(self) -> int:
-        return self.config.border_top + 1 + self.config.border_bottom
+        return (
+            self.config.border_top
+            + 2
+            + self.config.inter_tape_rows
+            + self.config.border_bottom
+        )
 
     @property
     def width(self) -> int:
@@ -141,8 +146,12 @@ class TapeLayout:
         )
 
     @property
-    def tape_row(self) -> int:
+    def input_row(self) -> int:
         return self.config.border_top
+
+    @property
+    def output_row(self) -> int:
+        return self.input_row + self.config.inter_tape_rows + 1
 
     @property
     def tape_slice(self) -> slice:
@@ -154,13 +163,15 @@ class TapeLayout:
     def tape_coordinates(self) -> tuple[tuple[int, int], ...]:
         return tuple(
             (
-                self.tape_row,
+                self.input_row,
                 self.config.border_left + index * self.config.stride,
             )
             for index in range(self.config.tape_slots)
         )
 
-    def render_tape(self, values: torch.Tensor) -> torch.Tensor:
+    def render_tape(self, values: torch.Tensor, lane: str = "input") -> torch.Tensor:
+        if lane not in {"input", "output"}:
+            raise ValueError("lane must be 'input' or 'output'")
         values = torch.as_tensor(values)
         if values.ndim < 1 or values.shape[-1] != self.config.tape_slots:
             raise ValueError(
@@ -173,19 +184,24 @@ class TapeLayout:
             device=values.device,
             dtype=values.dtype,
         )
-        grid[..., self.tape_row, self.tape_slice] = values
+        row = self.input_row if lane == "input" else self.output_row
+        grid[..., row, self.tape_slice] = values
         return grid
 
-    def extract_tape(self, grid: torch.Tensor) -> torch.Tensor:
+    def extract_tape(self, grid: torch.Tensor, lane: str = "output") -> torch.Tensor:
+        if lane not in {"input", "output"}:
+            raise ValueError("lane must be 'input' or 'output'")
         grid = torch.as_tensor(grid)
         if grid.ndim < 2 or grid.shape[-2:] != (self.height, self.width):
             raise ValueError(
                 f"grid must end with dimensions ({self.height}, {self.width})"
             )
-        return grid[..., self.tape_row, self.tape_slice]
+        row = self.input_row if lane == "input" else self.output_row
+        return grid[..., row, self.tape_slice]
 
     def schema(self) -> str:
         cells = [["." for _ in range(self.width)] for _ in range(self.height)]
         for row, column in self.tape_coordinates:
-            cells[row][column] = "T"
-        return "\n".join(" ".join(row) for row in cells) + "\nT: logical tape cell"
+            cells[row][column] = "I"
+            cells[self.output_row][column] = "O"
+        return "\n".join(" ".join(row) for row in cells) + "\nI: input  O: output"

@@ -31,11 +31,11 @@ def _validate_rollout(rollout: torch.Tensor) -> None:
         raise ValueError("rollout must contain finite floating-point states")
 
 
-def rollout_rgb(rollout: torch.Tensor, output_channel: int) -> torch.Tensor:
+def rollout_rgb(rollout: torch.Tensor, io_channel: int) -> torch.Tensor:
     _validate_rollout(rollout)
-    if not 0 <= output_channel < rollout.shape[1]:
-        raise ValueError("output channel index does not exist in rollout")
-    values = rollout[:, output_channel].clamp(-1.0, 1.0)
+    if not 0 <= io_channel < rollout.shape[1]:
+        raise ValueError("I/O channel index does not exist in rollout")
+    values = rollout[:, io_channel].clamp(-1.0, 1.0)
     neutral = values.new_tensor(_NEUTRAL)
     negative = values.new_tensor(_NEGATIVE)
     positive = values.new_tensor(_POSITIVE)
@@ -55,9 +55,9 @@ def _value_color(value: float) -> tuple[int, int, int]:
 
 
 def _raw_tapes(
-    rollout: torch.Tensor, layout: TapeLayout, output_channel: int
+    rollout: torch.Tensor, layout: TapeLayout, io_channel: int
 ) -> tuple[str, ...]:
-    values = layout.extract_tape(rollout[:, output_channel])
+    values = layout.extract_tape(rollout[:, io_channel])
     discrete = quantize(values).cpu().tolist()
     symbols = {-1: "0", 0: "B", 1: "1"}
     return tuple("".join(symbols[value] for value in row) for row in discrete)
@@ -95,8 +95,8 @@ def save_gif(
         raise ValueError("rollout dimensions do not match the layout and model")
 
     states = rollout.detach().cpu()
-    frames = rollout_rgb(states, config.model.output_channel).numpy()
-    raw_tapes = _raw_tapes(states, layout, config.model.output_channel)
+    frames = rollout_rgb(states, config.model.io_channel).numpy()
+    raw_tapes = _raw_tapes(states, layout, config.model.io_channel)
     images = [
         Image.fromarray(frame).resize(
             (frame.shape[1] * scale, frame.shape[0] * scale),
@@ -175,21 +175,22 @@ def _annotate_frame(
         fill=foreground,
         font=font,
     )
-    for index, (row, column) in enumerate(layout.tape_coordinates):
-        x, y = left + column * scale, top + row * scale
-        draw.rectangle(
-            (x, y, x + scale - 1, y + scale - 1),
-            outline="#ffcc33",
-            width=max(1, scale // 12),
-        )
-        if scale >= 12:
-            draw.text(
-                (x + scale // 2, y - 2),
-                str(index),
-                fill="#ffcc33",
-                font=font,
-                anchor="ms",
+    for index, (_, column) in enumerate(layout.tape_coordinates):
+        for row, label in ((layout.input_row, "I"), (layout.output_row, "O")):
+            x, y = left + column * scale, top + row * scale
+            draw.rectangle(
+                (x, y, x + scale - 1, y + scale - 1),
+                outline="#ffcc33",
+                width=max(1, scale // 12),
             )
+            if scale >= 12:
+                draw.text(
+                    (x + scale // 2, y - 2),
+                    f"{label}{index}",
+                    fill="#ffcc33",
+                    font=font,
+                    anchor="ms",
+                )
     _draw_scale(draw, left, top + frame.height + 8, font, foreground)
     return image
 

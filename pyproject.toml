@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ncpu-computer"
-version = "0.3.0"
-description = "A neural cellular automaton with a direct ternary tape interface"
+version = "0.4.0"
+description = "A neural cellular automaton with a two-lane direct ternary tape interface"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [

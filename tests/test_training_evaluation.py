@@ -16,7 +16,7 @@ from ncpu_computer.validation import validate_experiment
 from ncpu_computer.tape import TapeLayout
 
 
-def tiny_setup(*, updates=2, fire_rate=1.0, input_mode="mutable"):
+def tiny_setup(*, updates=2, fire_rate=1.0):
     geometry = GeometryConfig(
         tape_slots=3,
         stride=2,
@@ -32,7 +32,6 @@ def tiny_setup(*, updates=2, fire_rate=1.0, input_mode="mutable"):
             fixed_kernels=("identity",),
             learnable_kernels=0,
             fire_rate=fire_rate,
-            input_mode=input_mode,
             max_abs_state=None,
         ),
         training=TrainingConfig(
@@ -52,7 +51,7 @@ def tiny_setup(*, updates=2, fire_rate=1.0, input_mode="mutable"):
     return config, TaskDataset.from_task(task, geometry.tape_slots)
 
 
-def test_supervised_loss_uses_only_output_tape_and_requested_window():
+def test_supervised_loss_uses_only_output_lane_and_requested_window():
     geometry = GeometryConfig(
         tape_slots=4,
         stride=2,
@@ -64,14 +63,14 @@ def test_supervised_loss_uses_only_output_tape_and_requested_window():
     layout = TapeLayout(geometry)
     rollout = torch.zeros(1, 4, 4, layout.height, layout.width)
     predicted = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    rollout[:, 2:4, 2, layout.tape_row, layout.tape_slice] = predicted
-    rollout[:, 2:4, 2, 0, 0] = 1000.0
-    rollout[:, 2:4, 1, layout.tape_row, layout.tape_slice] = 1000.0
+    rollout[:, 2:4, 1, layout.output_row, layout.tape_slice] = predicted
+    rollout[:, 2:4, 1, 0, 0] = 1000.0
+    rollout[:, 2:4, 1, layout.input_row, layout.tape_slice] = 1000.0
     losses = supervised_loss(
         rollout,
         torch.zeros(1, 4),
         layout,
-        output_channel=2,
+        io_channel=1,
         free_steps=1,
         supervision_steps=2,
     )
@@ -120,14 +119,14 @@ def test_exhaustive_validation_loss_is_independent_of_batch_partition():
     assert first.model.training
 
 
-def test_short_fit_writes_loadable_version_three_checkpoints(tmp_path):
+def test_short_fit_writes_loadable_version_four_checkpoints(tmp_path):
     config, dataset = tiny_setup(updates=1)
     trainer = Trainer(config, dataset)
     history = trainer.fit(tmp_path, progress_every=1)
     assert len(history) == 1
     model, loaded_config, checkpoint = load_model(tmp_path / "best.pt", "cpu")
     assert loaded_config == config
-    assert checkpoint["format_version"] == 3
+    assert checkpoint["format_version"] == 4
     assert checkpoint["dataset_signature"] == dataset.signature
     assert not model.training
     other_data = TaskDataset.from_task(reverse_task(2), config.geometry.tape_slots)
@@ -156,7 +155,7 @@ def test_zero_output_model_evaluates_empty_target_exactly():
     assert result.mean_raw_accuracy == 1.0
 
 
-def test_inference_reads_the_separate_zero_output_channel():
+def test_inference_reads_the_zero_output_lane():
     config, _ = tiny_setup()
     model = Trainer(config, TaskDataset.from_task(reverse_task(1), 3)).model
     result = infer(model, config.geometry, "101", steps=0)
@@ -165,10 +164,9 @@ def test_inference_reads_the_separate_zero_output_channel():
     assert result.interpreted.binary_strings == ("",)
 
 
-def test_validation_covers_core_invariants_for_both_input_modes():
-    for mode in ("mutable", "frozen"):
-        config, dataset = tiny_setup(input_mode=mode)
-        report = validate_experiment(config, dataset)
-        assert "direct input and zero output initialization" in report.checks
-        assert "full-tape MSE and gradients" in report.checks
-        assert report.examples == len(dataset)
+def test_validation_covers_core_invariants():
+    config, dataset = tiny_setup()
+    report = validate_experiment(config, dataset)
+    assert "direct input and zero output-lane initialization" in report.checks
+    assert "full-tape MSE and gradients" in report.checks
+    assert report.examples == len(dataset)

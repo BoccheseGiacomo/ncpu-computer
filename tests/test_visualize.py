@@ -20,7 +20,7 @@ def test_evolution_phase_follows_training_window():
         evolution_phase(-1, training)
 
 
-def test_rollout_rgb_shows_only_output_channel_on_fixed_scale():
+def test_rollout_rgb_shows_only_io_channel_on_fixed_scale():
     rollout = torch.zeros(1, 4, 1, 5)
     rollout[0, 1, 0] = 10.0
     rollout[0, 2, 0] = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])
@@ -30,7 +30,7 @@ def test_rollout_rgb_shows_only_output_channel_on_fixed_scale():
     assert torch.equal(rgb[0, 0, 0], rgb[0, 0, 1])
     assert torch.equal(rgb[0, 0, 3], rgb[0, 0, 4])
     assert torch.equal(rgb[0, 0, 2], torch.tensor([245, 245, 245]))
-    with pytest.raises(ValueError, match="output channel"):
+    with pytest.raises(ValueError, match="I/O channel"):
         rollout_rgb(rollout, 4)
 
 
@@ -46,14 +46,14 @@ def test_save_gif_writes_every_output_frame(tmp_path):
     config = replace(ExperimentConfig(), geometry=geometry)
     layout = TapeLayout(geometry)
     rollout = torch.zeros(3, config.model.channels, layout.height, layout.width)
-    rollout[0, config.model.output_channel] = layout.render_tape(
-        torch.tensor([[1.0, 0.0, -1.0]])
+    rollout[0, config.model.io_channel] = layout.render_tape(
+        torch.tensor([[1.0, 0.0, -1.0]]), "output"
     )[0]
-    rollout[1, config.model.output_channel] = layout.render_tape(
-        torch.tensor([[1.0, 0.0, 0.0]])
+    rollout[1, config.model.io_channel] = layout.render_tape(
+        torch.tensor([[1.0, 0.0, 0.0]]), "output"
     )[0]
-    rollout[2, config.model.output_channel] = layout.render_tape(
-        torch.tensor([[-1.0, 0.0, 0.0]])
+    rollout[2, config.model.io_channel] = layout.render_tape(
+        torch.tensor([[-1.0, 0.0, 0.0]]), "output"
     )[0]
     path = save_gif(
         rollout,

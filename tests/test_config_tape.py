@@ -22,9 +22,8 @@ def test_config_round_trip_and_channel_roles():
         model=ModelConfig(program_channels=2, computation_channels=4),
     )
     assert ExperimentConfig.from_dict(config.to_dict()) == config
-    assert config.model.input_channel == 2
-    assert config.model.output_channel == 3
-    assert config.model.channels == 8
+    assert config.model.io_channel == 2
+    assert config.model.channels == 7
     with pytest.raises(ValueError, match="tape_slots"):
         replace(config.geometry, tape_slots=0).validate()
     with pytest.raises(TypeError, match="integers"):
@@ -43,9 +42,11 @@ def test_layout_renders_only_strided_tape_cells():
     layout = TapeLayout(geometry)
     values = torch.tensor([[1.0, -1.0, 0.0, 1.0]])
     grid = layout.render_tape(values)
-    assert grid.shape == (1, 4, 8)
-    assert torch.equal(layout.extract_tape(grid), values)
+    assert grid.shape == (1, 7, 8)
+    assert torch.count_nonzero(layout.extract_tape(grid)) == 0
+    assert torch.equal(layout.extract_tape(grid, "input"), values)
     assert layout.tape_coordinates == ((1, 1), (1, 3), (1, 5), (1, 7))
+    assert layout.output_row == 4
     assert torch.count_nonzero(grid) == 3
 
 

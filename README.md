@@ -20,23 +20,30 @@ There is no learned input encoder or output decoder.
 
 ## Tape geometry
 
-The logical tape contains `N` cells on one horizontal row. Consecutive logical
-cells have configurable centre-to-centre stride `s`, and the four external
-borders are independently configurable:
+The grid contains two aligned horizontal tapes with `N` logical slots each:
+input above, output below. Both use the same origin and centre-to-centre stride
+`s` (default 2). Left, right, top, bottom, and inter-tape spacing are
+independently configurable:
 
 ```text
-height = top + 1 + bottom
+height = top + 1 + inter_tape_rows + 1 + bottom
 width  = left + (N - 1)s + 1 + right
 
 working space above
 
-left | x0 . x1 . x2 . ... . x(N-1) | right
+left | I0 . I1 . I2 . ... . I(N-1) | right
+
+working space between tapes
+
+left | O0 . O1 . O2 . ... . O(N-1) | right
 
 working space below
 ```
 
-Only `x0 ... x(N-1)` are logical tape positions. Intervening and border cells
-are ordinary mutable NCA working space initialized to zero.
+Only the marked cells are logical tape positions. Other cells are NCA working
+space initialized to zero. Optional `wrap_y` joins the top and bottom edges
+for perception; horizontal edges never wrap. Without `wrap_y`, the configured
+zero, reflect, or replicate padding applies on both axes.
 
 Strings are left-aligned. There is no compulsory leading blank, terminator
 slot, or additional tail position. A shorter string is represented by implicit
@@ -54,24 +61,18 @@ A full-length string occupies all `N` positions and needs no final blank.
 
 ## Channels
 
-Input and output use the same logical coordinates but separate state channels.
-The default six-channel state is:
+Input and output use separate rows of the same mutable channel. The default
+five-channel state is:
 
 | Channel | Role | Mutable |
 |---:|---|---|
 | 0 | zero program channel | no |
-| 1 | direct input tape | configurable |
-| 2 | direct output tape | yes |
-| 3–5 | computation state | yes |
+| 1 | shared input/output state | yes |
+| 2–4 | computation state | yes |
 
-At time zero, the encoded input is injected only into the input channel. The
-program, output, and computation channels are zero everywhere. In particular,
-the output does not receive a copy of the input.
-
-`input_mode="frozen"` preserves the complete initial input channel exactly
-throughout evolution. `input_mode="mutable"` allows it to participate in the
-computation. The program channel is always restored exactly after every update,
-and the output channel is always mutable.
+At time zero, the encoded input is injected into the upper tape. The lower
+tape, program, and computation state start at zero. The entire I/O channel is
+mutable during evolution; only the program channel is read-only and zero.
 
 ## Local computation
 
@@ -131,7 +132,8 @@ width and boundary distance.
 ## Training and readout
 
 The target is used only to calculate loss. It is never injected during
-evolution. After `F` free computation steps, the output tape is supervised at
+evolution. The upper input tape is not supervised after initialization. After
+`F` free computation steps, the lower output tape is supervised at
 every state in a window of `S` steps:
 
 ```text
@@ -139,7 +141,7 @@ F + 1, F + 2, ..., F + S
 ```
 
 The sole objective is ordinary mean squared error over examples, supervised
-timesteps, and every logical output position:
+timesteps, and every logical position of the lower tape:
 
 ```text
 loss = mean((output_tape - target_tape)^2)
@@ -177,14 +179,14 @@ jupyter lab run/run.ipynb
 [`run/run.ipynb`](run/run.ipynb) also works without an editable installation
 when launched from either the repository root or `run/`. Its first code cell
 exposes the shared task, tape capacities, lengths, geometry, channel counts,
-input mutability, local rule, optimizer, and supervision settings. It always
+vertical wrapping, local rule, optimizer, and supervision settings. It always
 runs the structural checks and prints the physical layout before any optional
 action.
 
 Training, checkpoint loading, post-training validation, and visualization have
 controls in their respective cells. Post-training validation evaluates one
-configurable exact input length. The visualization shows only the output
-channel on a fixed `-1` to `+1` color scale and marks the logical tape cells.
+configurable exact input length. The visualization shows only the shared I/O
+channel on a fixed `-1` to `+1` color scale and marks both logical tapes.
 
 ## Repository structure
 
@@ -202,7 +204,7 @@ run/run.ipynb     configurable bit-NOT and reversal workflow
 tests/            CPU regression tests
 ```
 
-Checkpoint format 3 belongs to this direct scalar, separate-channel model.
+Checkpoint format 4 belongs to this direct scalar, two-lane shared-channel model.
 Incompatible representation formats are rejected explicitly.
 
 ## Direction

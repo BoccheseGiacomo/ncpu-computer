@@ -17,6 +17,7 @@ class GeometryConfig:
     border_right: int = 3
     border_top: int = 3
     border_bottom: int = 3
+    inter_tape_rows: int = 2
 
     def validate(self) -> None:
         values = (
@@ -26,6 +27,7 @@ class GeometryConfig:
             self.border_right,
             self.border_top,
             self.border_bottom,
+            self.inter_tape_rows,
         )
         if any(type(value) is not int for value in values):
             raise TypeError("geometry dimensions must be integers")
@@ -34,14 +36,13 @@ class GeometryConfig:
         if self.stride < 1:
             raise ValueError("stride must be positive")
         if any(value < 0 for value in values[2:]):
-            raise ValueError("borders cannot be negative")
+            raise ValueError("borders and inter-tape spacing cannot be negative")
 
 
 @dataclass(frozen=True)
 class ModelConfig:
     program_channels: int = 1
     computation_channels: int = 3
-    input_mode: str = "mutable"
     hidden_size: int = 96
     fixed_kernels: tuple[str, ...] = ("identity", "sobel_x", "sobel_y")
     fixed_laplacian: bool = False
@@ -51,20 +52,17 @@ class ModelConfig:
     gate_bias: float = 1.0
     fire_rate: float = 1.0
     padding: str = "zeros"
+    wrap_y: bool = False
     max_abs_state: float | None = 10.0
     random_kernel_seed: int = 0
 
     @property
-    def input_channel(self) -> int:
+    def io_channel(self) -> int:
         return self.program_channels
 
     @property
-    def output_channel(self) -> int:
-        return self.program_channels + 1
-
-    @property
     def channels(self) -> int:
-        return self.program_channels + 2 + self.computation_channels
+        return self.program_channels + 1 + self.computation_channels
 
     def validate(self) -> None:
         integers = (
@@ -80,8 +78,8 @@ class ModelConfig:
             raise ValueError("program_channels must be positive")
         if self.computation_channels < 0:
             raise ValueError("computation_channels cannot be negative")
-        if self.input_mode not in {"mutable", "frozen"}:
-            raise ValueError("input_mode must be 'mutable' or 'frozen'")
+        if type(self.wrap_y) is not bool:
+            raise TypeError("wrap_y must be a bool")
         if self.hidden_size < 1:
             raise ValueError("hidden_size must be positive")
         if self.random_kernel_seed < 0:
@@ -110,7 +108,7 @@ class ModelConfig:
             raise ValueError(f"gate must be one of {sorted(SUPPORTED_GATES)}")
         if not 0.0 < self.fire_rate <= 1.0:
             raise ValueError("fire_rate must be in (0, 1]")
-        if self.padding not in {"zeros", "reflect", "replicate", "circular"}:
+        if self.padding not in {"zeros", "reflect", "replicate"}:
             raise ValueError("unsupported padding mode")
         if self.max_abs_state is not None and self.max_abs_state <= 0:
             raise ValueError("max_abs_state must be positive or None")

@@ -13,7 +13,7 @@ def notebook_cells(path):
     return ["".join(cell["source"]) for cell in code_cells]
 
 
-def test_single_clean_notebook_exposes_direct_tape_workflow():
+def test_single_clean_notebook_exposes_two_lane_workflow():
     run_directory = Path(__file__).parents[1] / "run"
     notebooks = list(run_directory.glob("*.ipynb"))
     assert [path.name for path in notebooks] == ["run.ipynb"]
@@ -22,12 +22,13 @@ def test_single_clean_notebook_exposes_direct_tape_workflow():
     first = cells[0]
     assert 'TASK_NAME = "bit_not"' in first
     assert '"reverse": reverse_task' in first
-    assert "TRAIN_MAX_LENGTH = 7" in first
-    assert "TRAIN_TAPE_SLOTS = TRAIN_MAX_LENGTH" in first
-    assert "TEST_LENGTH = TRAIN_MAX_LENGTH" in first
+    assert "TRAIN_MAX_LENGTH =" in first
+    assert "TRAIN_TAPE_SLOTS =" in first
+    assert "TEST_LENGTH =" in first
     assert "TEST_TAPE_SLOTS = TRAIN_TAPE_SLOTS" in first
     assert "STRIDE = 2" in first
-    assert 'INPUT_MODE = "mutable"' in first
+    assert "INTER_TAPE_ROWS = 2" in first
+    assert "WRAP_Y = False" in first
     assert "PROGRAM_CHANNELS = 1" in first
     assert "COMPUTATION_CHANNELS = 3" in first
     assert "GeometryConfig(" in first
@@ -42,6 +43,7 @@ def test_single_clean_notebook_exposes_direct_tape_workflow():
     assert "save_gif(" in source
     assert "include_shorter=False" in source
     assert "render_tape(encoded)" in source
+    assert "model_config.io_channel" in first
     assert "validation_dataset = TaskDataset.from_task(" in cells[2]
     assert "TEST_TAPE_SLOTS" in cells[2]
     assert "EXTRAPOLATION_LENGTH" not in source
