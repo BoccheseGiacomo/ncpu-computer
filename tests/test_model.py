@@ -1,134 +1,114 @@
 import pytest
 import torch
 
-from ncpu_computer.config import GeometryConfig, ModelConfig
-from ncpu_computer.model import NeuralCellularAutomaton, perception_kernel
-from ncpu_computer.tape import TapeLayout
+from ncpu_computer import (
+    GeometryConfig,
+    ModelConfig,
+    NeuralCellularAutomaton,
+    TapeLayout,
+)
+from ncpu_computer.model import Perception, perception_kernel
 
 
 TASKS = ("copy", "reverse")
+GEOMETRY = GeometryConfig()
 
 
-def make_model(config=ModelConfig(), geometry=GeometryConfig()):
+def make_model(config=ModelConfig()):
     torch.manual_seed(0)
-    return NeuralCellularAutomaton(config, geometry, TASKS)
+    return NeuralCellularAutomaton(config, GEOMETRY, TASKS)
 
 
-def test_default_model_has_expected_roles_and_parameter_count():
+def test_default_model_has_shared_io_and_zero_periodic_program():
     model = make_model()
-    assert model.parameter_count == 3279
-    assert model.config.channels == 6
-    assert model.config.input_channel == 1
-    assert model.config.output_channel == 2
+    assert model.config.channels == 5
+    assert model.config.io_channel == 1
     assert model.perception.kernel_count == 4
-    assert model.programs.shape == (2, 1, 7, 21)
+    assert model.programs.shape == (2, 1, 3, 2)
+    assert model.program_parameters == ()
+    assert torch.count_nonzero(model.programs) == 0
 
 
-def test_grid_program_selection_injects_input_and_zero_output():
-    model = make_model()
-    layout = model.layout
-    input_grid = layout.render_tape(torch.randn(2, layout.config.tape_slots))
-    state = model.initial_state(input_grid, torch.tensor([1, 0]))
-    assert torch.equal(state[:, model.config.input_channel], input_grid)
-    assert torch.count_nonzero(state[:, model.config.output_channel]) == 0
-    assert torch.equal(state[0, 0], model.programs[1, 0])
-    assert torch.equal(state[1, 0], model.programs[0, 0])
-    assert not torch.equal(model.programs[0], model.programs[1])
-
-
-def test_tape_program_is_zero_outside_logical_positions():
-    geometry = GeometryConfig(tape_slots=4, stride=2, border_left=1, border_right=1)
-    config = ModelConfig(program_channels=2, program_placement="tape")
-    model = make_model(config, geometry)
-    grid = model.program_grid(torch.tensor([0, 1]))
-    layout = TapeLayout(geometry)
-    assert grid.shape == (2, 2, layout.height, layout.width)
-    assert torch.equal(layout.extract_tape(grid), model.programs)
-    occupied = torch.zeros(layout.height, layout.width, dtype=torch.bool)
-    occupied[layout.tape_row, layout.tape_slice] = True
-    assert torch.count_nonzero(grid[:, :, ~occupied]) == 0
-
-
-def test_zero_delta_initialization_produces_identity_dynamics():
-    model = make_model()
-    input_grid = model.layout.render_tape(torch.randn(2, 8))
-    state = model.initial_state(input_grid, torch.tensor([0, 1]))
-    rollout = model(state, 3)
-    assert torch.equal(rollout, state.unsqueeze(1).expand_as(rollout))
-
-
-@pytest.mark.parametrize("program_mutable", [False, True])
-@pytest.mark.parametrize("input_mode", ["mutable", "frozen"])
-def test_program_and_separate_input_mutability(program_mutable, input_mode):
-    config = ModelConfig(
-        program_mutable=program_mutable,
-        input_mode=input_mode,
-        max_abs_state=None,
-    )
+def test_program_repeats_from_absolute_zero_for_variable_tapes():
+    config = ModelConfig(program_channels=2, program_mode="learned_read_only")
     model = make_model(config)
     with torch.no_grad():
-        model.rule.output.weight.fill_(0.1)
-    state = model.initial_state(
-        model.layout.render_tape(torch.randn(2, 8)), torch.tensor([0, 1])
-    )
-    updated = model.step(state)
-    if program_mutable:
-        assert not torch.equal(updated[:, : config.program_channels], state[:, :1])
-    else:
-        assert torch.equal(updated[:, : config.program_channels], state[:, :1])
-    if input_mode == "frozen":
+        model.programs.copy_(
+            torch.arange(model.programs.numel()).reshape_as(model.programs)
+        )
+    for slots in (3, 8):
+        layout = TapeLayout(GEOMETRY, slots)
+        grid = model.program_grid(torch.tensor([1]), layout.width)
+        for x in range(0, layout.width, GEOMETRY.stride):
+            assert torch.equal(grid[0, :, :, x : x + 2], model.programs[1])
+        state = model.initial_state(
+            layout.render_tape(torch.ones(1, slots)), torch.tensor([1])
+        )
+        assert torch.equal(state[0, :2], grid[0])
         assert torch.equal(
-            updated[:, config.input_channel], state[:, config.input_channel]
+            layout.extract_tape(state[:, config.io_channel]), torch.ones(1, slots)
         )
-    else:
-        assert not torch.equal(
-            updated[:, config.input_channel], state[:, config.input_channel]
-        )
-    assert not torch.equal(
-        updated[:, config.output_channel], state[:, config.output_channel]
-    )
 
 
-def test_shared_io_starts_with_input_and_is_mutable():
-    config = ModelConfig(io_mode="shared", input_mode="mutable", max_abs_state=None)
-    model = make_model(config)
-    input_grid = model.layout.render_tape(torch.randn(2, 8))
-    state = model.initial_state(input_grid, torch.tensor([0, 1]))
-    assert config.input_channel == config.output_channel
-    assert torch.equal(state[:, config.output_channel], input_grid)
+@pytest.mark.parametrize(
+    "mode,changes",
+    [("zero", False), ("learned_read_only", False), ("learned_mutable", True)],
+)
+def test_program_mutability_modes(mode, changes):
+    model = make_model(ModelConfig(program_mode=mode, max_abs_state=None))
     with torch.no_grad():
         model.rule.output.weight.fill_(0.1)
-    assert not torch.equal(model.step(state)[:, config.output_channel], input_grid)
-
-
-@pytest.mark.parametrize("gate", ["none", "linear", "sigmoid", "tanh", "relu"])
-@pytest.mark.parametrize("padding", ["zeros", "reflect", "replicate", "circular"])
-def test_gates_and_padding_preserve_identity_initialization(gate, padding):
-    config = ModelConfig(
-        hidden_size=4,
-        fixed_kernels=("identity",),
-        learnable_kernels=0,
-        gate=gate,
-        padding=padding,
+    layout = TapeLayout(GEOMETRY, 3)
+    state = model.initial_state(layout.render_tape(torch.ones(1, 3)), torch.tensor([0]))
+    updated = model.step(state)
+    assert (not torch.equal(updated[:, :1], state[:, :1])) is changes
+    assert not torch.equal(
+        updated[:, model.config.io_channel], state[:, model.config.io_channel]
     )
-    model = make_model(config)
-    state = model.initial_state(
-        model.layout.render_tape(torch.randn(2, 8)), torch.tensor([0, 1])
-    )
-    assert torch.equal(model.step(state), state)
 
 
-def test_model_rejects_wrong_geometry_and_task_indices():
+def test_zero_delta_initialization_is_identity_at_every_shape():
     model = make_model()
-    with pytest.raises(ValueError, match="fixed model geometry"):
-        model.initial_state(torch.zeros(1, 2, 2), torch.tensor([0]))
-    input_grid = model.layout.render_tape(torch.zeros(1, 8))
-    with pytest.raises(ValueError, match="out of range"):
-        model.initial_state(input_grid, torch.tensor([2]))
+    for slots in (2, 5):
+        layout = TapeLayout(GEOMETRY, slots)
+        state = model.initial_state(
+            layout.render_tape(torch.randn(2, slots)), torch.tensor([0, 1])
+        )
+        assert torch.equal(
+            model(state, 3), state.unsqueeze(1).expand(-1, 4, -1, -1, -1)
+        )
+
+
+def test_vertical_wrap_never_wraps_horizontally():
+    config = ModelConfig(fixed_kernels=("sobel_y",), learnable_kernels=0, hidden_size=2)
+    wrapped = Perception(config, wrap_y=True)
+    zero = Perception(config, wrap_y=False)
+    state = torch.zeros(1, config.channels, 3, 5)
+    state[:, :, 0, 2] = 1.0
+    assert torch.count_nonzero(wrapped(state)[:, :, 2, 2]) > 0
+    assert torch.count_nonzero(zero(state)[:, :, 2, 2]) == 0
+    state.zero_()
+    state[:, :, 1, 0] = 1.0
+    horizontal = Perception(
+        ModelConfig(fixed_kernels=("sobel_x",), learnable_kernels=0), wrap_y=True
+    )(state)
+    assert torch.count_nonzero(horizontal[:, :, :, -1]) == 0
+
+
+def test_noise_is_training_only_and_zero_avoids_randomness():
+    model = make_model()
+    with torch.no_grad():
+        model.rule.output.weight.fill_(0.1)
+    layout = TapeLayout(GEOMETRY, 3)
+    state = model.initial_state(layout.render_tape(torch.ones(1, 3)), torch.tensor([0]))
+    before = torch.get_rng_state()
+    model.step(state, 0.0)
+    assert torch.equal(before, torch.get_rng_state())
+    model.eval()
+    assert torch.equal(model.step(state, 0.2), model.step(state, 0.2))
 
 
 def test_random_kernel_is_seeded_and_normalized():
     first = perception_kernel("random", 7)
-    second = perception_kernel("random", 7)
-    assert torch.equal(first, second)
+    assert torch.equal(first, perception_kernel("random", 7))
     assert float(first.norm()) == pytest.approx(1.0)

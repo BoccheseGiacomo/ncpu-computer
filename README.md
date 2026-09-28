@@ -1,205 +1,212 @@
 # ncpu-computer
 
-`ncpu-computer` studies whether one small local neural cellular automaton (NCA)
-rule can learn several computations. The task is selected by a learned program,
-the grid supplies working memory, and repeated local updates supply computation
-time.
+**ncpu-computer** tests whether a small local neural cellular automaton (NCA)
+can learn algorithms that remain correct when the tape and computation time
+change. The current design deliberately returns to the simplest interface that
+worked best in earlier experiments: one tape and one shared input/output
+channel.
 
-The programmed model follows three observations from the earlier single-task
-direct-tape experiments: bit-NOT, a strictly local operation, learned quickly;
-reversal learned within the training lengths but did not extrapolate to longer
-strings; addition neither learned reliably nor generalized. Separating a
-learned task program from one shared rule makes the next question explicit:
-which reusable local dynamics can support computations with different spatial
-requirements?
+Bit-NOT, a local operation, learned quickly in earlier versions. Reversal could
+fit trained lengths but did not reliably extrapolate, while addition did not
+learn reliably. This version targets that failure directly by varying tape
+capacity, input length, and rollout time during training, without changing the
+local rule.
 
-## A type-independent tape interface
+## A type-independent interface
 
-The model does not receive Python integers or task-specific tensors. It reads
-and writes strings over one fixed alphabet:
+The NCA does not receive integers or task-specific structures. It reads and
+writes strings over one alphabet:
 
-| Symbol | State value | Meaning |
+| Symbol | Cell value | Role |
 |---|---:|---|
-| `0` | `-1` | binary zero |
-| `B` | `0` | blank or separator |
-| `1` | `+1` | binary one |
+| 0 | -1 | binary zero |
+| B | 0 | blank or separator |
+| 1 | +1 | binary one |
 
-`B` fills unused tape capacity and can separate fields in structured strings.
-An external deterministic codec may serialize integers, Boolean sequences,
-tuples, or other finite data into `{0, 1, B}`. The NCA therefore has one
-general interface independent of the original data type. There is no learned
-input encoder or output decoder.
+Any finite data type can be serialized externally into a {0, 1, B} string. The
+learned system therefore operates through one general interface, independent
+of the source data type. B fills unused capacity and may separate values. There
+is no learned encoder or decoder.
 
-Strings are left-aligned and shorter strings are blank-padded:
+Strings are left-aligned. Training examples are ordered by length, beginning
+with the completely blank input:
 
-```text
-BBBB   empty
-0BBB
-1BBB
-00BB
-01BB
-```
+~~~text
+BBBB...
+0BBB...
+1BBB...
+00BB...
+01BB...
+10BB...
+11BB...
+~~~
 
-The full output tape is read in parallel. Continuous values are converted back
-to symbols using the literal threshold `0.333`:
+The complete target tape is supervised. If the target is 101 on a ten-slot
+tape, the target tensor represents 101BBBBBBB, and all seven blank cells
+contribute to the ordinary mean-squared error.
 
-```text
-value >  +0.333 -> 1
-value <  -0.333 -> 0
-otherwise       -> B
-```
+At inference, continuous tape values are converted to raw symbols with the
+literal thresholds:
 
-Interpretation of that raw ternary string is an external inference step.
+~~~text
+value >  +0.333  -> 1
+value <  -0.333  -> 0
+otherwise        -> B
+~~~
 
-## Geometry
+An external interpreter may then stop at the first blank, split on blanks, or
+apply another data-specific convention. This interpretation is not part of
+training.
 
-The logical tape has `N` positions on one grid row. Adjacent logical positions
-have configurable stride `s`; intervening cells and the four borders are NCA
-working space initialized to zero.
+## Layout
 
-```text
-height = top + 1 + bottom
-width  = left + (N - 1)s + 1 + right
+A tape has N logical cells at configurable stride S. It lies on the central row
+of a grid with symmetric vertical space and equal horizontal space on both
+sides:
 
-working space above
-left | x0 . x1 . x2 . ... . x(N-1) | right
-working space below
-```
+~~~text
+height = 2 * vertical_space + 1
+width  = 2 * horizontal_space + N * stride
 
-Only `x0 ... x(N-1)` are supervised tape positions. A target shorter than `N`
-is completed with `B`, so every unused slot is explicitly trained toward zero.
+. . . . . . . . . . . .
+. . . T . T . T . T . .
+. . . . . . . . . . . .
+~~~
 
-Full-grid programs depend on this exact geometry. Training and evaluation must
-therefore use the same tape capacity, stride, and borders. Length extrapolation
-is tested inside that fixed capacity by training on short strings and testing
-on longer strings.
+For the default stride 2, each T is the right-middle cell of its two-column
+stride block. Only these logical cells are injected and supervised; all other
+cells are working space. Horizontal perception always uses zero padding.
+Vertical perception can use either zero padding or circular wrapping.
+Horizontal wrapping is never used.
 
-## Programs and channels
+The NCA state is:
 
-Each task has its own learned initial program, selected by task index. All tasks
-share the same perception and update-rule parameters.
+~~~text
+program channels | shared mutable I/O channel | computation channels
+~~~
 
-Two program placements are supported:
+The input is written into the I/O channel. That same channel evolves and is
+read as the output.
 
-- `grid`: a learned value at every grid cell and program channel;
-- `tape`: learned values only at logical tape positions, with exact zero
-  elsewhere.
+## Repeated task program
 
-Programs start as small independent zero-mean random values. They are read-only
-during evolution by default, but remain differentiable and are trained through
-their effect on the computation. `program_mutable=True` allows the local rule
-to update them. Program parameters use their own optimizer weight decay.
+A task program is a small tile with shape:
 
-The default separate-I/O state is:
+~~~text
+program_channels x grid_height x stride
+~~~
 
-```text
-program | input | output | computation channels
-```
+It starts at absolute horizontal coordinate zero and repeats across the full
+grid, including the boundary space:
 
-The input may be mutable or frozen. The output starts at zero and is always
-mutable. Optional shared-I/O mode instead uses:
+~~~text
+program[:, y, x] = tile[:, y, x % stride]
+~~~
 
-```text
-program | shared input/output | computation channels
-```
+Tiles are adjacent and never overlap. Their parameter count is independent of
+tape capacity, and every tape cell sees the same program phase.
 
-The shared channel starts with the input, evolves, and is read as output; it
-cannot be frozen.
+Three modes are available:
+
+- **zero**: fixed all-zero program; the default single-task baseline.
+- **learned_read_only**: a learned initial tile fixed during each rollout.
+- **learned_mutable**: a learned initial tile that may also evolve.
+
+The shared update rule and program can be optimized jointly or separately.
+They have independent weight decay. A future task can therefore adapt only a
+small program while retaining a frozen rule.
 
 ## Local computation
 
-At every cell and timestep, the NCA applies the same rule:
+Every cell applies the same update at every timestep:
 
-```text
-D_t     = U_theta(P(X_t))
-Y_t     = clip(X_t + M * D_t)
-X_(t+1) = M * Y_t + (1 - M) * X_t
-```
+~~~text
+perception = depthwise_3x3(state)
+delta      = pointwise_network(perception)
+state      = state + mutable_mask * delta
+~~~
 
-`P` is a configurable bank of depthwise `3 x 3` perception kernels.
-`U_theta` is a shared two-layer `1 x 1` network with a ReLU hidden layer, and
-`M` marks mutable channels. The output projection begins at zero, so initial
-dynamics are exactly the identity. Gating, stochastic firing, clipping,
-padding, and learned perception kernels remain configurable.
+The pointwise network is 1x1 -> ReLU -> 1x1. Its final projection starts at
+zero, so the initial dynamics are exactly the identity. Perception kernels,
+hidden width, gating, stochastic firing, and state clipping remain
+configurable.
 
-The rule's parameter count is independent of tape length and task count. The
-program bank grows with the number of tasks and, in `grid` mode, with grid size.
+Optional Gaussian noise is added after perception during training only. Its
+standard deviation is linearly annealed across optimizer updates. The default
+is zero throughout, so no noise tensor is generated.
 
-## Tasks
+## Variable-shape training
 
-The notebook trains these tasks together:
+One optimizer update contains N_TRIALS sequential trials. Each trial has its
+own tape capacity, maximum input length, and computation time. Values are
+sampled from coupled non-overlapping strata, so a default three-trial update
+contains distinct small, medium, and large cases.
 
-```text
+For each trial:
+
+1. Build every binary input from length zero through the sampled maximum.
+2. Sample the same batch size for every enabled task.
+3. Run the trial on its own unpadded grid.
+4. Average MSE over tasks, examples, supervised times, and all tape cells.
+5. Backpropagate trial_loss / N_TRIALS immediately.
+
+After all trials, gradients are clipped once and the optimizer steps once.
+Different shapes are never padded or masked into one batch, and only the
+largest individual trial graph needs to be resident at a time.
+
+The free-evolution time is resampled on every update. The supervision-window
+length is round(supervision_ratio * free_steps); the default ratio is 1.6. The
+complete configured ranges are active from the first update.
+
+## Tasks and evaluation
+
+Built-in string tasks are:
+
+~~~text
 copy       101 -> 101
 bit_not    101 -> 010
 reverse    101 -> 101
-parity     101 -> 0       (odd number of ones -> 1, even -> 0)
+parity     101 -> 0
 append_0   101 -> 1010
 append_1   101 -> 1011
-```
+~~~
 
-Every task receives the same ordered inputs: the empty string, then every
-binary string of lengths `1 ... TRAIN_MAX_LENGTH`. Empty-input behavior is:
+The notebook defaults to one task, while the library supports balanced
+multi-task batches, one tile per task, and one shared rule.
 
-```text
-copy, bit_not, reverse: BBBB -> BBBB
-parity, append_0:       BBBB -> 0BBB
-append_1:               BBBB -> 1BBB
-```
-
-Tape capacity is chosen explicitly and is never enlarged automatically. The
-dataset construction fails if any input or target does not fit; append tasks
-therefore require at least `TRAIN_MAX_LENGTH + 1` slots.
-
-## Balanced multi-task training
-
-Each optimizer update samples the same number of examples from every task,
-concatenates and shuffles them, selects the corresponding programs, and runs
-one tensorized rollout. For each task, the loss is ordinary MSE over examples,
-all supervised timesteps, and the complete logical tape. The task means are
-then averaged equally:
-
-```text
-task_loss = mean((output_tape - target_tape)^2)
-loss      = mean(task_loss over tasks)
-```
-
-This is equivalent to averaging the task gradients, without six sequential
-rollouts. Targets are used only in the loss and are never injected into the
-evolving state.
-
-After `F` free steps, supervision is applied over a window of `S` states:
-
-```text
-F + 1, F + 2, ..., F + S
-```
-
-Evaluation reports each task separately and an equally weighted aggregate.
-Inference always requires an explicit task name.
+Evaluation uses explicit deterministic cases. Each case specifies tape
+capacity, exact input length, free steps, and supervised steps. Reports include
+MSE, symbol accuracy, exact full-tape accuracy, interpreted semantic accuracy,
+stability across the supervision window, and best-timestep statistics.
 
 ## Running experiments
 
 On Windows:
 
-```powershell
+~~~powershell
 conda env create -f environment.yml
 conda activate slackenv
 pip install -e ".[dev,notebook]"
 pytest -q
 jupyter lab run/run.ipynb
-```
+~~~
 
-[`run/run.ipynb`](run/run.ipynb) works from either the repository root or the
-`run` directory. Its first code cell exposes the task list, fixed geometry,
-program and channel modes, local rule, optimizer, supervision, and validation
-settings. Structural checks and the layout print unconditionally. Training,
-post-training evaluation, and GIF generation have controls in their own cells.
-The GIF displays only the channel used for readout on a fixed `-1 ... +1`
-color scale.
+[run/run.ipynb](run/run.ipynb) is the only experiment notebook. Its cells are
+organized as follows:
 
-Checkpoint format 4 stores the ordered tasks, dataset signatures, program bank,
-fixed geometry, I/O mode, model, optimizer, and random states. Older formats
-are rejected rather than adapted.
+1. all scientific settings, structural validation, layouts, channel roles, and
+   example ordering;
+2. training, loading, and checkpoint controls;
+3. post-training evaluation controls;
+4. visualization controls.
 
-This project is an experimental test of programmable local computation; it
-does not claim computational universality.
+The GIF shows only the evolving shared I/O channel on a fixed [-1, +1] scale,
+with the selected task's initial program tile displayed separately.
+
+Checkpoint format 5 stores the full configuration, ordered task signatures,
+model, program, optimizer groups, progress, history, and all random-generator states.
+Resuming reproduces trial sampling, batches, firing masks, and perception
+noise. Older formats are intentionally rejected.
+
+This is an experimental study of programmable local computation; it does not
+claim computational universality.

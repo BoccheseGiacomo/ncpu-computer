@@ -66,8 +66,10 @@ def binary_strings(
     include_shorter: bool = True,
     include_empty: bool = True,
 ) -> tuple[str, ...]:
-    if type(max_length) is not int or max_length < 1:
-        raise ValueError("max_length must be a positive integer")
+    if type(max_length) is not int or max_length < 0:
+        raise ValueError("max_length must be a non-negative integer")
+    if max_length == 0:
+        return ("",)
     if include_empty and not include_shorter:
         raise ValueError("include_empty requires include_shorter")
     lengths = range(1, max_length + 1) if include_shorter else (max_length,)

@@ -5,7 +5,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from .config import GeometryConfig, ModelConfig
-from .tape import TapeLayout
 
 
 def perception_kernel(name: str, random_seed: int = 0) -> torch.Tensor:
@@ -31,10 +30,10 @@ def perception_kernel(name: str, random_seed: int = 0) -> torch.Tensor:
 
 
 class Perception(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, wrap_y: bool):
         super().__init__()
         self.channels = config.channels
-        self.padding = config.padding
+        self.wrap_y = wrap_y
         fixed_names = list(config.fixed_kernels)
         if config.fixed_laplacian:
             fixed_names.append("laplacian")
@@ -69,8 +68,11 @@ class Perception(nn.Module):
             .expand(self.channels, -1, -1, -1)
             .reshape(self.channels * self.kernel_count, 1, 3, 3)
         )
-        padding_mode = "constant" if self.padding == "zeros" else self.padding
-        padded = F.pad(state, (1, 1, 1, 1), mode=padding_mode)
+        if self.wrap_y:
+            padded = F.pad(state, (0, 0, 1, 1), mode="circular")
+            padded = F.pad(padded, (1, 1, 0, 0), mode="constant")
+        else:
+            padded = F.pad(state, (1, 1, 1, 1), mode="constant")
         return F.conv2d(padded, filters, groups=self.channels)
 
 
@@ -132,33 +134,27 @@ class NeuralCellularAutomaton(nn.Module):
         self.config = config
         self.geometry = geometry
         self.task_names = tuple(task_names)
-        self.layout = TapeLayout(geometry)
-        program_shape = (
+        shape = (
             len(task_names),
             config.program_channels,
-            self.layout.height,
-            self.layout.width,
+            geometry.height,
+            geometry.stride,
         )
-        if config.program_placement == "tape":
-            program_shape = (
-                len(task_names),
-                config.program_channels,
-                geometry.tape_slots,
-            )
-        self.programs = nn.Parameter(torch.empty(program_shape))
-        nn.init.normal_(self.programs, std=config.program_init_std)
-        self.perception = Perception(config)
+        if config.program_mode == "zero":
+            self.register_buffer("programs", torch.zeros(shape))
+        else:
+            self.programs = nn.Parameter(torch.empty(shape))
+            nn.init.normal_(self.programs, std=config.program_init_std)
+        self.perception = Perception(config, geometry.wrap_y)
         self.rule = UpdateRule(config, config.channels * self.perception.kernel_count)
         update_mask = torch.ones(1, config.channels, 1, 1)
         if not config.program_mutable:
             update_mask[:, : config.program_channels] = 0.0
-        if config.io_mode == "separate" and config.input_mode == "frozen":
-            update_mask[:, config.input_channel] = 0.0
         self.register_buffer("update_mask", update_mask)
 
     @property
     def device(self) -> torch.device:
-        return next(self.parameters()).device
+        return next(self.rule.parameters()).device
 
     @property
     def parameter_count(self) -> int:
@@ -172,24 +168,36 @@ class NeuralCellularAutomaton(nn.Module):
             if name != "programs"
         )
 
+    @property
+    def program_parameters(self) -> tuple[nn.Parameter, ...]:
+        return (self.programs,) if isinstance(self.programs, nn.Parameter) else ()
+
     def task_index(self, task_name: str) -> int:
         try:
             return self.task_names.index(task_name)
         except ValueError as error:
             raise ValueError(f"unknown task: {task_name!r}") from error
 
-    def program_grid(self, task_indices: torch.Tensor) -> torch.Tensor:
+    def _validate_grid_shape(self, height: int, width: int) -> None:
+        usable = width - 2 * self.geometry.horizontal_space
+        if (
+            height != self.geometry.height
+            or usable < self.geometry.stride
+            or usable % self.geometry.stride
+        ):
+            raise ValueError("grid shape is incompatible with the model geometry")
+
+    def program_grid(self, task_indices: torch.Tensor, width: int) -> torch.Tensor:
+        self._validate_grid_shape(self.geometry.height, width)
         task_indices = torch.as_tensor(
-            task_indices, dtype=torch.int64, device=self.programs.device
+            task_indices, dtype=torch.int64, device=self.device
         )
         if task_indices.ndim != 1:
             raise ValueError("task_indices must be one-dimensional")
         if bool(((task_indices < 0) | (task_indices >= len(self.task_names))).any()):
             raise ValueError("task index is out of range")
         selected = self.programs[task_indices]
-        if self.config.program_placement == "tape":
-            selected = self.layout.render_tape(selected)
-        return selected
+        return selected.repeat(1, 1, 1, width // self.geometry.stride)
 
     def initial_state(
         self, input_grid: torch.Tensor, task_indices: torch.Tensor
@@ -198,44 +206,47 @@ class NeuralCellularAutomaton(nn.Module):
             raise ValueError("input_grid must have shape (batch, height, width)")
         if not torch.is_floating_point(input_grid):
             raise ValueError("input_grid must be floating point")
-        if input_grid.shape[1:] != (self.layout.height, self.layout.width):
-            raise ValueError("input grid does not match the fixed model geometry")
         if input_grid.device != self.device:
             raise ValueError("input grid and model must be on the same device")
+        self._validate_grid_shape(*input_grid.shape[1:])
         task_indices = torch.as_tensor(
-            task_indices, dtype=torch.int64, device=self.programs.device
+            task_indices, dtype=torch.int64, device=self.device
         )
         if task_indices.ndim != 1 or task_indices.shape[0] != input_grid.shape[0]:
             raise ValueError("one task index is required per input")
         state = torch.zeros(
             input_grid.shape[0],
             self.config.channels,
-            input_grid.shape[1],
-            input_grid.shape[2],
+            *input_grid.shape[1:],
             device=input_grid.device,
             dtype=input_grid.dtype,
         )
-        state[:, : self.config.program_channels] = self.program_grid(task_indices).to(
-            dtype=input_grid.dtype
-        )
-        state[:, self.config.input_channel] = input_grid
+        state[:, : self.config.program_channels] = self.program_grid(
+            task_indices, input_grid.shape[-1]
+        ).to(dtype=input_grid.dtype)
+        state[:, self.config.io_channel] = input_grid
         return state
 
-    def step(self, state: torch.Tensor) -> torch.Tensor:
+    def step(
+        self, state: torch.Tensor, perception_noise_std: float = 0.0
+    ) -> torch.Tensor:
         if state.ndim != 4 or state.shape[1] != self.config.channels:
             raise ValueError(
                 f"state must have shape (batch, {self.config.channels}, height, width)"
             )
-        delta = self.rule(self.perception(state)) * self.update_mask
+        self._validate_grid_shape(*state.shape[-2:])
+        if (
+            not isinstance(perception_noise_std, (int, float))
+            or perception_noise_std < 0
+        ):
+            raise ValueError("perception_noise_std must be non-negative")
+        perceived = self.perception(state)
+        if self.training and perception_noise_std > 0:
+            perceived = perceived + torch.randn_like(perceived) * perception_noise_std
+        delta = self.rule(perceived) * self.update_mask
         if self.config.fire_rate < 1.0:
             fire_mask = (
-                torch.rand(
-                    state.shape[0],
-                    1,
-                    state.shape[2],
-                    state.shape[3],
-                    device=state.device,
-                )
+                torch.rand(state.shape[0], 1, *state.shape[2:], device=state.device)
                 < self.config.fire_rate
             )
             delta = delta * fire_mask
@@ -246,12 +257,17 @@ class NeuralCellularAutomaton(nn.Module):
             )
         return torch.where(self.update_mask.bool(), updated, state)
 
-    def forward(self, initial_state: torch.Tensor, steps: int) -> torch.Tensor:
+    def forward(
+        self,
+        initial_state: torch.Tensor,
+        steps: int,
+        perception_noise_std: float = 0.0,
+    ) -> torch.Tensor:
         if type(steps) is not int or steps < 0:
             raise ValueError("steps must be a non-negative integer")
         states = [initial_state]
         state = initial_state
         for _ in range(steps):
-            state = self.step(state)
+            state = self.step(state, perception_noise_std)
             states.append(state)
         return torch.stack(states, dim=1)

@@ -4,14 +4,15 @@ from dataclasses import dataclass
 
 import torch
 
-from .config import GeometryConfig
+from .config import GeometryConfig, TestCase
 from .model import NeuralCellularAutomaton
 from .tape import InterpretedTape, TapeLayout, encode_strings, interpret_tape, quantize
-from .tasks import MultiTaskDataset, TaskDataset, semantic_correct
+from .tasks import MultiTaskDataset, TaskDataset, binary_tasks, semantic_correct
 
 
 @dataclass(frozen=True)
 class EvaluationResult:
+    case: str
     task: str
     examples: int
     total_examples: int
@@ -37,6 +38,7 @@ class EvaluationResult:
 
     def summary(self) -> dict[str, float | int | str]:
         return {
+            "case": self.case,
             "task": self.task,
             "examples": self.examples,
             "total_examples": self.total_examples,
@@ -65,18 +67,13 @@ def evaluate(
     batch_size: int = 256,
     seed: int = 0,
     max_examples: int | None = None,
+    case_name: str = "custom",
 ) -> EvaluationResult:
     geometry.validate()
     if geometry != model.geometry:
-        raise ValueError("evaluation geometry differs from the fixed model geometry")
-    if dataset.tape_slots != geometry.tape_slots:
-        raise ValueError("dataset and geometry have different tape capacities")
+        raise ValueError("evaluation geometry differs from the model geometry")
     task_index = model.task_index(dataset.name)
-    if (
-        type(steps) is not int
-        or type(step_start) is not int
-        or type(step_end) is not int
-    ):
+    if any(type(value) is not int for value in (steps, step_start, step_end)):
         raise TypeError("evaluation steps must be integers")
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -84,9 +81,10 @@ def evaluate(
         raise ValueError("seed must be a non-negative integer")
     if not 0 <= step_start <= step_end <= steps:
         raise ValueError("evaluation steps must satisfy 0 <= start <= end <= steps")
-    if max_examples is not None:
-        if type(max_examples) is not int or max_examples < 1:
-            raise ValueError("max_examples must be a positive integer or None")
+    if max_examples is not None and (type(max_examples) is not int or max_examples < 1):
+        raise ValueError("max_examples must be a positive integer or None")
+    if not isinstance(case_name, str) or not case_name.strip():
+        raise ValueError("case_name must be a non-empty string")
 
     generator = torch.Generator().manual_seed(seed)
     if max_examples is not None and max_examples < len(dataset):
@@ -99,15 +97,13 @@ def evaluate(
     semantic_sums = torch.zeros(step_count, dtype=torch.float64)
     raw_sums = torch.zeros(step_count, dtype=torch.float64)
     symbol_sums = torch.zeros(step_count, dtype=torch.float64)
-    stable_semantic_sum = 0.0
-    stable_raw_sum = 0.0
-    layout = TapeLayout(geometry)
+    stable_semantic_sum = stable_raw_sum = 0.0
+    layout = TapeLayout(geometry, dataset.tape_slots)
     device = model.device
     was_training = model.training
     model.eval()
     devices = [device.index or 0] if device.type == "cuda" else []
     window = slice(step_start, step_end + 1)
-
     try:
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(seed)
@@ -119,15 +115,12 @@ def evaluate(
                     value.to(device) for value in dataset.take(batch_indices)
                 )
                 task_indices = torch.full(
-                    (len(batch_indices),),
-                    task_index,
-                    dtype=torch.int64,
-                    device=device,
+                    (len(batch_indices),), task_index, dtype=torch.int64, device=device
                 )
                 rollout = model(
                     model.initial_state(layout.render_tape(inputs), task_indices), steps
                 )
-                values = layout.extract_tape(rollout[:, :, model.config.output_channel])
+                values = layout.extract_tape(rollout[:, :, model.config.io_channel])
                 expected = targets.unsqueeze(1)
                 discrete = quantize(values)
                 discrete_targets = targets.to(torch.int8)
@@ -145,37 +138,38 @@ def evaluate(
     finally:
         model.train(was_training)
 
-    mse_curve = mse_sums / (count * geometry.tape_slots)
+    mse_curve = mse_sums / (count * dataset.tape_slots)
     semantic_curve = semantic_sums / count
     raw_curve = raw_sums / count
-    symbol_curve = symbol_sums / (count * geometry.tape_slots)
+    symbol_curve = symbol_sums / (count * dataset.tape_slots)
     mse_window = mse_curve[window]
     semantic_window = semantic_curve[window]
     best_semantic_offset = int(semantic_window.argmax())
     best_mse_offset = int(mse_window.argmin())
     return EvaluationResult(
-        task=dataset.name,
-        examples=count,
-        total_examples=len(dataset),
-        tape_slots=geometry.tape_slots,
-        batch_size=batch_size,
-        seed=seed,
-        step_start=step_start,
-        step_end=step_end,
-        mean_mse=float(mse_window.mean()),
-        mean_semantic_accuracy=float(semantic_window.mean()),
-        mean_raw_accuracy=float(raw_curve[window].mean()),
-        mean_symbol_accuracy=float(symbol_curve[window].mean()),
-        stable_semantic_accuracy=stable_semantic_sum / count,
-        stable_raw_accuracy=stable_raw_sum / count,
-        best_semantic_step=step_start + best_semantic_offset,
-        best_semantic_accuracy=float(semantic_window[best_semantic_offset]),
-        best_mse_step=step_start + best_mse_offset,
-        best_mse=float(mse_window[best_mse_offset]),
-        mse_by_step=tuple(map(float, mse_curve)),
-        semantic_by_step=tuple(map(float, semantic_curve)),
-        raw_by_step=tuple(map(float, raw_curve)),
-        symbol_by_step=tuple(map(float, symbol_curve)),
+        case_name,
+        dataset.name,
+        count,
+        len(dataset),
+        dataset.tape_slots,
+        batch_size,
+        seed,
+        step_start,
+        step_end,
+        float(mse_window.mean()),
+        float(semantic_window.mean()),
+        float(raw_curve[window].mean()),
+        float(symbol_curve[window].mean()),
+        stable_semantic_sum / count,
+        stable_raw_sum / count,
+        step_start + best_semantic_offset,
+        float(semantic_window[best_semantic_offset]),
+        step_start + best_mse_offset,
+        float(mse_window[best_mse_offset]),
+        tuple(map(float, mse_curve)),
+        tuple(map(float, semantic_curve)),
+        tuple(map(float, raw_curve)),
+        tuple(map(float, symbol_curve)),
     )
 
 
@@ -194,6 +188,7 @@ def infer(
     geometry: GeometryConfig,
     input_symbols: str,
     *,
+    tape_slots: int,
     task_name: str,
     steps: int,
     output_mode: str = "single",
@@ -203,24 +198,21 @@ def infer(
     if output_mode not in {"single", "multiple"}:
         raise ValueError("output_mode must be 'single' or 'multiple'")
     if geometry != model.geometry:
-        raise ValueError("inference geometry differs from the fixed model geometry")
-    layout = TapeLayout(geometry)
-    encoded = encode_strings((input_symbols,), geometry.tape_slots).to(model.device)
+        raise ValueError("inference geometry differs from the model geometry")
+    layout = TapeLayout(geometry, tape_slots)
+    encoded = encode_strings((input_symbols,), tape_slots).to(model.device)
     task_indices = torch.tensor([model.task_index(task_name)], device=model.device)
-    initial = model.initial_state(layout.render_tape(encoded), task_indices)
     was_training = model.training
     model.eval()
     try:
-        final = model(initial, steps)[:, -1, model.config.output_channel]
+        final = model(
+            model.initial_state(layout.render_tape(encoded), task_indices), steps
+        )[:, -1, model.config.io_channel]
         values = layout.extract_tape(final)[0].cpu()
     finally:
         model.train(was_training)
     return InferenceResult(
-        task=task_name,
-        input=input_symbols,
-        steps=steps,
-        values=values,
-        interpreted=interpret_tape(values, output_mode),
+        task_name, input_symbols, steps, values, interpret_tape(values, output_mode)
     )
 
 
@@ -236,12 +228,7 @@ def evaluate_tasks(
     results = [
         evaluate(model, geometry, dataset, **kwargs) for dataset in datasets.datasets
     ]
-    curves = (
-        "mse_by_step",
-        "semantic_by_step",
-        "raw_by_step",
-        "symbol_by_step",
-    )
+    curves = ("mse_by_step", "semantic_by_step", "raw_by_step", "symbol_by_step")
     averaged = {
         name: tuple(
             sum(values) / len(values)
@@ -257,10 +244,11 @@ def evaluate_tasks(
         range(len(semantic_window)), key=semantic_window.__getitem__
     )
     aggregate = EvaluationResult(
+        case=results[0].case,
         task="aggregate",
         examples=sum(result.examples for result in results),
         total_examples=sum(result.total_examples for result in results),
-        tape_slots=geometry.tape_slots,
+        tape_slots=datasets.tape_slots,
         batch_size=results[0].batch_size,
         seed=results[0].seed,
         step_start=results[0].step_start,
@@ -287,19 +275,51 @@ def evaluate_tasks(
     return [*results, aggregate]
 
 
+def evaluate_cases(
+    model: NeuralCellularAutomaton,
+    geometry: GeometryConfig,
+    task_names: tuple[str, ...],
+    cases: tuple[TestCase, ...],
+    *,
+    batch_size: int = 256,
+    seed: int = 0,
+    max_examples: int | None = None,
+) -> list[EvaluationResult]:
+    results = []
+    for case in cases:
+        case.validate()
+        datasets = MultiTaskDataset.from_tasks(
+            binary_tasks(task_names, case.input_length, include_shorter=False),
+            case.tape_slots,
+        )
+        results.extend(
+            evaluate_tasks(
+                model,
+                geometry,
+                datasets,
+                steps=case.steps,
+                step_start=case.free_steps + 1,
+                step_end=case.steps,
+                batch_size=batch_size,
+                seed=seed,
+                max_examples=max_examples,
+                case_name=case.name,
+            )
+        )
+    return results
+
+
 def format_results(results: list[EvaluationResult]) -> str:
-    header = (
-        "task             n  tape   steps      mse    semantic      raw   "
-        "symbol   stable"
-    )
-    lines = [header]
+    lines = [
+        "case              task             n  tape   steps      mse    "
+        "semantic      raw   symbol   stable"
+    ]
     for result in results:
         lines.append(
-            f"{result.task[:16]:<16} {result.examples:>5} "
+            f"{result.case[:17]:<17} {result.task[:16]:<16} {result.examples:>5} "
             f"{result.tape_slots:>5}  {result.step_start:>3}-{result.step_end:<3} "
             f"{result.mean_mse:>9.6f}  {result.mean_semantic_accuracy:>8.2%} "
-            f"{result.mean_raw_accuracy:>8.2%} "
-            f"{result.mean_symbol_accuracy:>8.2%} "
+            f"{result.mean_raw_accuracy:>8.2%} {result.mean_symbol_accuracy:>8.2%} "
             f"{result.stable_semantic_accuracy:>8.2%}"
         )
     return "\n".join(lines)

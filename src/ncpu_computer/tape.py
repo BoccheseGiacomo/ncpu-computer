@@ -48,17 +48,16 @@ def quantize(values: torch.Tensor) -> torch.Tensor:
         raise ValueError("values must be floating point")
     if not torch.isfinite(values).all():
         raise ValueError("values must be finite")
-    positive = values > TERNARY_THRESHOLD
-    negative = values < -TERNARY_THRESHOLD
-    return positive.to(torch.int8) - negative.to(torch.int8)
+    return (values > TERNARY_THRESHOLD).to(torch.int8) - (
+        values < -TERNARY_THRESHOLD
+    ).to(torch.int8)
 
 
 def tensor_to_symbols(values: torch.Tensor) -> str:
     values = torch.as_tensor(values)
     if values.ndim != 1:
         raise ValueError("single-example inference expects a one-dimensional tape")
-    discrete = quantize(values).cpu().tolist()
-    return "".join(VALUE_TO_SYMBOL[value] for value in discrete)
+    return "".join(VALUE_TO_SYMBOL[value] for value in quantize(values).cpu().tolist())
 
 
 def integer_to_binary(value: int) -> str:
@@ -92,16 +91,14 @@ def interpret_tape(values: torch.Tensor, mode: str = "single") -> InterpretedTap
     if mode == "single":
         end = raw.find("B")
         terminated = end >= 0
-        value = raw[:end] if terminated else raw
-        binary_strings = (value,)
-        valid = set(value) <= {"0", "1"}
+        binary_strings = (raw[:end] if terminated else raw,)
+        valid = True
     else:
         end = raw.find("BB")
         terminated = end >= 0
         prefix = raw[:end] if terminated else raw
-        parts = prefix.split("B") if prefix else [""]
-        binary_strings = tuple(parts)
-        valid = all(set(part) <= {"0", "1"} and part for part in parts)
+        binary_strings = tuple(prefix.split("B")) if prefix else ("",)
+        valid = all(part and set(part) <= {"0", "1"} for part in binary_strings)
     integer_valid = valid and all(
         value and (len(value) == 1 or value.startswith("1")) for value in binary_strings
     )
@@ -111,61 +108,55 @@ def interpret_tape(values: torch.Tensor, mode: str = "single") -> InterpretedTap
         else ()
     )
     return InterpretedTape(
-        raw=raw,
-        binary_strings=binary_strings,
-        integers=integers,
-        terminated=terminated,
-        valid=valid,
-        integer_valid=integer_valid,
+        raw, binary_strings, integers, terminated, valid, integer_valid
     )
 
 
 @dataclass(frozen=True)
 class TapeLayout:
     config: GeometryConfig
+    tape_slots: int
 
     def __post_init__(self) -> None:
         self.config.validate()
+        if type(self.tape_slots) is not int or self.tape_slots < 1:
+            raise ValueError("tape_slots must be a positive integer")
 
     @property
     def height(self) -> int:
-        return self.config.border_top + 1 + self.config.border_bottom
+        return self.config.height
 
     @property
     def width(self) -> int:
-        return (
-            self.config.border_left
-            + (self.config.tape_slots - 1) * self.config.stride
-            + 1
-            + self.config.border_right
-        )
+        return 2 * self.config.horizontal_space + self.tape_slots * self.config.stride
 
     @property
     def tape_row(self) -> int:
-        return self.config.border_top
+        return self.config.vertical_space
+
+    @property
+    def tape_start(self) -> int:
+        return self.config.horizontal_space + self.config.stride // 2
 
     @property
     def tape_slice(self) -> slice:
-        start = self.config.border_left
-        stop = start + self.config.tape_slots * self.config.stride
-        return slice(start, stop, self.config.stride)
+        return slice(
+            self.tape_start,
+            self.tape_start + self.tape_slots * self.config.stride,
+            self.config.stride,
+        )
 
     @property
     def tape_coordinates(self) -> tuple[tuple[int, int], ...]:
         return tuple(
-            (
-                self.tape_row,
-                self.config.border_left + index * self.config.stride,
-            )
-            for index in range(self.config.tape_slots)
+            (self.tape_row, self.tape_start + index * self.config.stride)
+            for index in range(self.tape_slots)
         )
 
     def render_tape(self, values: torch.Tensor) -> torch.Tensor:
         values = torch.as_tensor(values)
-        if values.ndim < 1 or values.shape[-1] != self.config.tape_slots:
-            raise ValueError(
-                f"values must end with a dimension of {self.config.tape_slots}"
-            )
+        if values.ndim < 1 or values.shape[-1] != self.tape_slots:
+            raise ValueError(f"values must end with a dimension of {self.tape_slots}")
         grid = torch.zeros(
             *values.shape[:-1],
             self.height,
@@ -188,4 +179,6 @@ class TapeLayout:
         cells = [["." for _ in range(self.width)] for _ in range(self.height)]
         for row, column in self.tape_coordinates:
             cells[row][column] = "T"
-        return "\n".join(" ".join(row) for row in cells) + "\nT: logical tape cell"
+        return (
+            "\n".join(" ".join(row) for row in cells) + "\nT: shared mutable I/O cell"
+        )
