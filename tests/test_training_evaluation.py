@@ -255,7 +255,7 @@ def test_checkpoint_and_variable_case_evaluation(tmp_path):
     trainer.fit(tmp_path, progress_every=1)
     model, loaded, checkpoint = load_model(tmp_path / "best.pt", "cpu")
     assert loaded == config
-    assert checkpoint["format_version"] == 8
+    assert checkpoint["format_version"] == 9
     assert checkpoint["task_specs"] == TASK_SPECS
     assert len(checkpoint["task_signatures"]) == 2
     assert set(trainer.history[-1]["validation_accuracies"]) == {

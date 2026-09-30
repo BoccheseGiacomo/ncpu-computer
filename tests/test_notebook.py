@@ -22,12 +22,19 @@ def test_single_notebook_exposes_complete_workflow():
     assert '("reverse_not", 2.0)' in first
     assert '("gray_encode", 1.0)' in first
     assert "TASK_NAMES, TASK_WEIGHTS = validate_task_specs(TASKS)" in first
-    assert 'EXPERIMENT_NAME = "binary_multitask"' in first
+    assert 'EXPERIMENT_NAME = "binary_multitask_attention"' in first
     assert "STRIDE = 2" in first
     assert "VERTICAL_SPACE = 1" in first
     assert "HORIZONTAL_SPACE = 2" in first
     assert "PROGRAM_START = 1" in first
     assert 'PROGRAM_MODE = "learned_read_only"' in first
+    assert "CONVOLUTION_ENABLED = True" in first
+    assert "ATTENTION_ENABLED = True" in first
+    assert "ATTENTION_RADIUS = 1" in first
+    assert "ATTENTION_DIM = 16" in first
+    assert "ATTENTION_HEADS = 1" in first
+    assert "ATTENTION_DISTANCE_BIAS = False" in first
+    assert "ATTENTION_QK_CAP = None" in first
     assert "TRAIN_RULE = True" in first
     assert "TRAIN_PROGRAM = True" in first
     assert "BASE_TAPE_SLOTS = (5, 7, 8, 9, 11)" in first

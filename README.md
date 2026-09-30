@@ -127,15 +127,32 @@ small program while retaining a frozen rule.
 Every cell applies the same update at every timestep:
 
 ~~~text
-perception = depthwise_3x3(state)
-delta      = pointwise_network(perception)
-state      = state + mutable_mask * delta
+convolution_features = depthwise_3x3(state)       # optional
+attention_features   = local_attention(state)     # optional
+perception            = concatenate(enabled features)
+delta                 = pointwise_network(perception)
+state                 = state + mutable_mask * delta
 ~~~
+
+Convolution and attention can be enabled independently, but at least one must
+be active. Local attention uses the complete cell state, a configurable square
+radius, and one or more heads. Its default radius is one, giving a 3x3
+neighborhood. Non-wrapping positions outside the grid are masked before the
+softmax. Vertical wrapping uses unique periodic neighbors even when the radius
+exceeds the three-row grid height; horizontal wrapping is never used.
+
+Attention has no positional encoding by default. An optional learned radial
+bias distinguishes Chebyshev-distance rings without encoding direction or
+absolute position. No state normalization is applied. An optional smooth norm
+cap can limit queries and keys independently in each head, while values remain
+uncapped so their magnitude continues to carry information.
 
 The pointwise network is 1x1 -> ReLU -> 1x1. Its final projection starts at
 zero, so the initial dynamics are exactly the identity. Perception kernels,
-hidden width, gating, stochastic firing, and state clipping remain
-configurable.
+attention size, hidden width, gating, stochastic firing, and state clipping
+remain configurable. When gating is enabled, the same pointwise network
+produces both the delta and its gate after convolution and attention have been
+combined.
 
 Optional Gaussian noise is added after perception during training only. Its
 standard deviation is linearly annealed across optimizer updates. The default
@@ -163,7 +180,8 @@ For each trial:
 1. Build every binary input from length zero through the sampled maximum.
 2. Sample the same batch size for every enabled task.
 3. Run the trial on its own unpadded grid.
-4. Average MSE over tasks, examples, supervised times, and all tape cells.
+4. Compute each task's MSE over its examples, supervised times, and all tape
+   cells, then take the normalized task-weighted mean.
 5. Backpropagate `trial_loss / number_of_base_pairs` immediately.
 
 After all trials, gradients are clipped once and the optimizer steps once.
@@ -215,9 +233,11 @@ append_0          1011 -> 10110
 append_1          1011 -> 10111
 ~~~
 
-The notebook defaults to the nine length-preserving tasks from `copy` through
-`increment`. Multi-task batches are balanced, with one learned tile per task
-and one shared update rule.
+The notebook defaults to seven length-preserving tasks from `copy` through
+`gray_encode`. Multi-task batches are balanced, with one learned tile per task
+and one shared update rule. Task weights affect only the normalized MSE, not
+the number of examples: `reverse` and `reverse_not` default to weight two and
+the other tasks to weight one.
 
 Evaluation uses explicit deterministic cases. Each case specifies tape
 capacity, exact input length, free steps, and supervised steps. Only binary

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -76,6 +78,117 @@ class Perception(nn.Module):
         return F.conv2d(padded, filters, groups=self.channels)
 
 
+class LocalAttention(nn.Module):
+    def __init__(self, config: ModelConfig, wrap_y: bool):
+        super().__init__()
+        self.channels = config.channels
+        self.radius = config.attention_radius
+        self.attention_dim = config.attention_dim
+        self.heads = config.attention_heads
+        self.head_dim = self.attention_dim // self.heads
+        self.wrap_y = wrap_y
+        self.qk_cap = config.attention_qk_cap
+        self.qkv = nn.Conv2d(
+            self.channels, 3 * self.attention_dim, kernel_size=1, bias=False
+        )
+        if config.attention_distance_bias:
+            self.distance_bias = nn.Parameter(torch.zeros(self.heads, self.radius + 1))
+        else:
+            self.register_parameter("distance_bias", None)
+        self._neighborhood_cache = {}
+
+    def _vertical_offsets(self, height: int) -> tuple[int, ...]:
+        if not self.wrap_y:
+            return tuple(range(-self.radius, self.radius + 1))
+        nearest = {}
+        for offset in range(-self.radius, self.radius + 1):
+            residue = offset % height
+            previous = nearest.get(residue)
+            if previous is None or (abs(offset), offset) < (
+                abs(previous),
+                previous,
+            ):
+                nearest[residue] = offset
+        return tuple(sorted(nearest.values()))
+
+    def _metadata(
+        self, height: int, width: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (height, width, device.type, device.index)
+        cached = self._neighborhood_cache.get(key)
+        if cached is not None:
+            return cached
+        offsets = tuple(
+            (dy, dx)
+            for dy in self._vertical_offsets(height)
+            for dx in range(-self.radius, self.radius + 1)
+        )
+        dy = torch.tensor([item[0] for item in offsets], device=device)
+        dx = torch.tensor([item[1] for item in offsets], device=device)
+        rows = torch.arange(height, device=device)
+        columns = torch.arange(width, device=device)
+        source_y = rows[None, :, None] + dy[:, None, None]
+        source_x = columns[None, None, :] + dx[:, None, None]
+        valid_x = (source_x >= 0) & (source_x < width)
+        if self.wrap_y:
+            source_y = source_y.remainder(height)
+            valid_y = torch.ones_like(source_y, dtype=torch.bool)
+        else:
+            valid_y = (source_y >= 0) & (source_y < height)
+            source_y = source_y.clamp(0, height - 1)
+        source_x = source_x.clamp(0, width - 1)
+        valid = (valid_y & valid_x).expand(-1, height, width)
+        indices = (source_y * width + source_x).expand(-1, height, width)
+        distances = torch.maximum(dy.abs(), dx.abs())
+        cached = (indices, valid, distances)
+        self._neighborhood_cache[key] = cached
+        return cached
+
+    def _neighbors(
+        self, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        height, width = value.shape[-2:]
+        indices, valid, distances = self._metadata(height, width, value.device)
+        gathered = value.flatten(-2)[..., indices]
+        gathered = gathered.permute(0, 1, 2, 4, 5, 3)
+        mask = valid.permute(1, 2, 0)
+        gathered = gathered.masked_fill(~mask[None, None, None], 0.0)
+        return gathered, mask, distances
+
+    def _soft_cap(self, value: torch.Tensor) -> torch.Tensor:
+        if self.qk_cap is None:
+            return value
+        scale = torch.sqrt(
+            1.0 + value.square().sum(dim=2, keepdim=True) / self.qk_cap**2
+        )
+        return value / scale
+
+    def attention(
+        self, state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, _, height, width = state.shape
+        qkv = self.qkv(state).reshape(
+            batch, 3, self.heads, self.head_dim, height, width
+        )
+        query, key, value = qkv.unbind(dim=1)
+        query = self._soft_cap(query)
+        key = self._soft_cap(key)
+        keys, mask, distances = self._neighbors(key)
+        values, _, _ = self._neighbors(value)
+        logits = torch.einsum("bndhw,bndhwk->bnhwk", query, keys)
+        logits = logits / math.sqrt(self.head_dim)
+        if self.distance_bias is not None:
+            bias = self.distance_bias[:, distances].to(dtype=logits.dtype)
+            logits = logits + bias[None, :, None, None]
+        logits = logits.masked_fill(~mask[None, None], -torch.inf)
+        weights = torch.softmax(logits, dim=-1)
+        attended = (weights[:, :, None] * values).sum(dim=-1)
+        return attended.reshape(batch, self.attention_dim, height, width), weights, mask
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.attention(state)[0]
+
+
 class UpdateRule(nn.Module):
     def __init__(self, config: ModelConfig, perception_channels: int):
         super().__init__()
@@ -145,8 +258,20 @@ class NeuralCellularAutomaton(nn.Module):
         else:
             self.programs = nn.Parameter(torch.empty(shape))
             nn.init.normal_(self.programs, std=config.program_init_std)
-        self.perception = Perception(config, geometry.wrap_y)
-        self.rule = UpdateRule(config, config.channels * self.perception.kernel_count)
+        if config.convolution_enabled:
+            self.perception = Perception(config, geometry.wrap_y)
+            convolution_channels = config.channels * self.perception.kernel_count
+        else:
+            self.perception = None
+            convolution_channels = 0
+        if config.attention_enabled:
+            self.attention = LocalAttention(config, geometry.wrap_y)
+            attention_channels = config.attention_dim
+        else:
+            self.attention = None
+            attention_channels = 0
+        perception_channels = convolution_channels + attention_channels
+        self.rule = UpdateRule(config, perception_channels)
         update_mask = torch.ones(1, config.channels, 1, 1)
         if not config.program_mutable:
             update_mask[:, : config.program_channels] = 0.0
@@ -246,7 +371,12 @@ class NeuralCellularAutomaton(nn.Module):
             or perception_noise_std < 0
         ):
             raise ValueError("perception_noise_std must be non-negative")
-        perceived = self.perception(state)
+        features = []
+        if self.perception is not None:
+            features.append(self.perception(state))
+        if self.attention is not None:
+            features.append(self.attention(state))
+        perceived = features[0] if len(features) == 1 else torch.cat(features, dim=1)
         if self.training and perception_noise_std > 0:
             perceived = perceived + torch.randn_like(perceived) * perception_noise_std
         delta = self.rule(perceived) * self.update_mask

@@ -16,7 +16,7 @@ from .evaluation import (
     format_results,
     infer,
 )
-from .model import NeuralCellularAutomaton
+from .model import LocalAttention, NeuralCellularAutomaton
 from .tape import (
     TERNARY_THRESHOLD,
     InterpretedTape,
@@ -78,6 +78,7 @@ __all__ = [
     "InferenceResult",
     "InterpretedTape",
     "LossComponents",
+    "LocalAttention",
     "ModelConfig",
     "MultiTaskDataset",
     "NeuralCellularAutomaton",

@@ -21,7 +21,7 @@ from .tape import TapeLayout, quantize
 from .tasks import MultiTaskDataset, StringTask, binary_tasks, semantic_correct
 
 
-CHECKPOINT_FORMAT = 8
+CHECKPOINT_FORMAT = 9
 
 
 def validate_task_specs(

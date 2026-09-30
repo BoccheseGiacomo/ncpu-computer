@@ -55,6 +55,13 @@ class ModelConfig:
     fixed_laplacian: bool = False
     learnable_kernels: int = 1
     learnable_kernel_init: str = "laplacian"
+    convolution_enabled: bool = True
+    attention_enabled: bool = True
+    attention_radius: int = 1
+    attention_dim: int = 16
+    attention_heads: int = 1
+    attention_distance_bias: bool = False
+    attention_qk_cap: float | None = None
     gate: str = "none"
     gate_bias: float = 1.0
     fire_rate: float = 1.0
@@ -79,6 +86,9 @@ class ModelConfig:
             self.computation_channels,
             self.hidden_size,
             self.learnable_kernels,
+            self.attention_radius,
+            self.attention_dim,
+            self.attention_heads,
             self.random_kernel_seed,
         )
         if any(type(value) is not int for value in integers):
@@ -100,12 +110,16 @@ class ModelConfig:
             raise ValueError("model scalar hyperparameters must be finite")
         if self.program_init_std < 0:
             raise ValueError("program_init_std cannot be negative")
-        if (
+        if type(self.convolution_enabled) is not bool:
+            raise TypeError("convolution_enabled must be a boolean")
+        if type(self.fixed_laplacian) is not bool:
+            raise TypeError("fixed_laplacian must be a boolean")
+        if self.convolution_enabled and (
             not self.fixed_kernels
             and not self.fixed_laplacian
             and not self.learnable_kernels
         ):
-            raise ValueError("at least one perception kernel is required")
+            raise ValueError("enabled convolution requires a perception kernel")
         unknown = set(self.fixed_kernels) - SUPPORTED_FIXED_KERNELS
         if unknown:
             raise ValueError(f"unsupported fixed kernels: {sorted(unknown)}")
@@ -115,6 +129,26 @@ class ModelConfig:
             raise ValueError("learnable_kernels cannot be negative")
         if self.learnable_kernel_init not in {"laplacian", "random"}:
             raise ValueError("learnable_kernel_init must be 'laplacian' or 'random'")
+        if type(self.attention_enabled) is not bool:
+            raise TypeError("attention_enabled must be a boolean")
+        if not self.convolution_enabled and not self.attention_enabled:
+            raise ValueError("convolution or attention must be enabled")
+        if type(self.attention_distance_bias) is not bool:
+            raise TypeError("attention_distance_bias must be a boolean")
+        if self.attention_radius < 0:
+            raise ValueError("attention_radius cannot be negative")
+        if self.attention_dim < 1 or self.attention_heads < 1:
+            raise ValueError("attention dimensions and heads must be positive")
+        if self.attention_dim % self.attention_heads:
+            raise ValueError("attention_dim must be divisible by attention_heads")
+        if self.attention_qk_cap is not None:
+            if (
+                not isinstance(self.attention_qk_cap, (int, float))
+                or isinstance(self.attention_qk_cap, bool)
+                or not math.isfinite(self.attention_qk_cap)
+                or self.attention_qk_cap <= 0
+            ):
+                raise ValueError("attention_qk_cap must be positive and finite or None")
         if self.gate not in SUPPORTED_GATES:
             raise ValueError(f"gate must be one of {sorted(SUPPORTED_GATES)}")
         if not 0.0 < self.fire_rate <= 1.0:

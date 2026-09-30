@@ -85,6 +85,24 @@ def test_learning_rate_schedule_validation(changes, match):
         replace(config, training=replace(config.training, **changes)).validate()
 
 
+@pytest.mark.parametrize(
+    "changes,match",
+    [
+        ({"attention_dim": 10, "attention_heads": 3}, "divisible"),
+        ({"attention_radius": -1}, "radius"),
+        ({"attention_qk_cap": 0.0}, "qk_cap"),
+        ({"attention_qk_cap": float("inf")}, "qk_cap"),
+        (
+            {"convolution_enabled": False, "attention_enabled": False},
+            "convolution or attention",
+        ),
+    ],
+)
+def test_attention_configuration_validation(changes, match):
+    with pytest.raises(ValueError, match=match):
+        replace(ModelConfig(), **changes).validate()
+
+
 def test_layout_has_exact_symmetric_edges():
     geometry = GeometryConfig(stride=2, vertical_space=1, horizontal_space=2)
     layout = TapeLayout(geometry, 4)
