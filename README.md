@@ -233,11 +233,11 @@ append_0          1011 -> 10110
 append_1          1011 -> 10111
 ~~~
 
-The notebook defaults to seven length-preserving tasks from `copy` through
-`gray_encode`. Multi-task batches are balanced, with one learned tile per task
-and one shared update rule. Task weights affect only the normalized MSE, not
-the number of examples: `reverse` and `reverse_not` default to weight two and
-the other tasks to weight one.
+The notebook defaults to a single `reverse` task for direct comparison of
+convolution-only, attention-only, and combined local rules. It trains both the
+shared rule and a learned read-only repeated program for 2,000 updates. The two
+feature switches select the rule variant, and each variant writes to a distinct
+checkpoint directory.
 
 Evaluation uses explicit deterministic cases. Each case specifies tape
 capacity, exact input length, free steps, and supervised steps. Only binary

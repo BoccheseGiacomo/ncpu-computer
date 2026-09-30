@@ -17,26 +17,28 @@ def test_single_notebook_exposes_complete_workflow():
     assert [path.name for path in notebooks] == ["run.ipynb"]
     cells = notebook_cells(notebooks[0])
     first = cells[0]
-    assert '("copy", 1.0)' in first
-    assert '("reverse", 2.0)' in first
-    assert '("reverse_not", 2.0)' in first
-    assert '("gray_encode", 1.0)' in first
+    assert 'TASKS = (("reverse", 1.0),)' in first
     assert "TASK_NAMES, TASK_WEIGHTS = validate_task_specs(TASKS)" in first
-    assert 'EXPERIMENT_NAME = "binary_multitask_attention"' in first
+    assert 'EXPERIMENT_NAME = "reverse_local_rule_comparison"' in first
     assert "STRIDE = 2" in first
     assert "VERTICAL_SPACE = 1" in first
     assert "HORIZONTAL_SPACE = 2" in first
     assert "PROGRAM_START = 1" in first
     assert 'PROGRAM_MODE = "learned_read_only"' in first
+    assert "PROGRAM_CHANNELS = 2" in first
+    assert "COMPUTATION_CHANNELS = 4" in first
+    assert "HIDDEN_SIZE = 96" in first
     assert "CONVOLUTION_ENABLED = True" in first
     assert "ATTENTION_ENABLED = True" in first
-    assert "ATTENTION_RADIUS = 1" in first
+    assert "ATTENTION_RADIUS = 2" in first
     assert "ATTENTION_DIM = 16" in first
-    assert "ATTENTION_HEADS = 1" in first
-    assert "ATTENTION_DISTANCE_BIAS = False" in first
-    assert "ATTENTION_QK_CAP = None" in first
+    assert "ATTENTION_HEADS = 2" in first
+    assert "ATTENTION_DISTANCE_BIAS = True" in first
+    assert "ATTENTION_QK_CAP = 2.0" in first
     assert "TRAIN_RULE = True" in first
     assert "TRAIN_PROGRAM = True" in first
+    assert "UPDATES = 2000" in first
+    assert "BATCH_SIZE_PER_TASK = 64" in first
     assert "BASE_TAPE_SLOTS = (5, 7, 8, 9, 11)" in first
     assert "BASE_INPUT_MAX_LENGTHS = (3, 5, 6, 7, 8)" in first
     assert "TAPE_VARIATION = 0.20" in first
@@ -56,6 +58,9 @@ def test_single_notebook_exposes_complete_workflow():
     assert 'TestCase("longer_tape", 14, 8, 84, 126)' in first
     assert 'TestCase("longer_tape_input", 14, 11, 84, 126)' in first
     assert "validate_experiment(config, TASK_NAMES)" in first
+    assert '"conv_attention" if CONVOLUTION_ENABLED and ATTENTION_ENABLED' in first
+    assert 'else "convolution_only" if CONVOLUTION_ENABLED' in first
+    assert 'else "attention_only"' in first
     assert "layout = TapeLayout(geometry, trial.tape_slots)" in first
     assert 'f"{layout.schema()}"' in first
     assert "RUN_" not in first
@@ -68,5 +73,6 @@ def test_single_notebook_exposes_complete_workflow():
     assert "RUN_EVALUATION =" in cells[2]
     assert "evaluate_cases(" in cells[2]
     assert "RUN_VISUALIZATION =" in cells[3]
+    assert "VISUALIZATION_TASK = TASK_NAMES[0]" in cells[3]
     assert "program_tile=model.programs" in cells[3]
     assert "save_gif(" in cells[3]
