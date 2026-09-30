@@ -11,7 +11,17 @@ from .tasks import MultiTaskDataset, binary_tasks
 from .training import TrialSpec, sample_trials, supervised_loss
 
 
-DEFAULT_TASKS = ("copy", "bit_not", "reverse", "parity", "append_0", "append_1")
+DEFAULT_TASKS = (
+    "copy",
+    "bit_not",
+    "reverse",
+    "reverse_not",
+    "shift_left_zero",
+    "shift_right_zero",
+    "gray_encode",
+    "prefix_xor",
+    "increment",
+)
 
 
 @dataclass(frozen=True)
@@ -42,15 +52,25 @@ def validate_experiment(
     config.validate()
     binary_tasks(task_names, 0)
     trials = sample_trials(
-        config.training, torch.Generator().manual_seed(config.training.seed)
+        config.training,
+        task_names,
+        torch.Generator().manual_seed(config.training.seed),
     )
-    if len({trial.tape_slots for trial in trials}) != len(trials):
-        raise AssertionError("sampled tape capacities are not unique")
-    if len({trial.input_max_length for trial in trials}) != len(trials):
-        raise AssertionError("sampled input lengths are not unique")
-    if len({trial.free_steps for trial in trials}) != len(trials):
-        raise AssertionError("sampled computation times are not unique")
-    checks = ["stratified variable trials"]
+    if len(trials) != len(config.training.base_tape_slots):
+        raise AssertionError("one trial was not sampled for every base pair")
+    if any(trial.input_max_length > trial.tape_slots - 1 for trial in trials):
+        raise AssertionError("sampled input does not leave a blank tape cell")
+    checks = ["independently varied paired trials"]
+
+    for case in config.test_cases:
+        try:
+            MultiTaskDataset.from_tasks(
+                binary_tasks(task_names, case.input_length, include_shorter=False),
+                case.tape_slots,
+            )
+        except ValueError as error:
+            raise ValueError(f"test case {case.name!r}: {error}") from error
+    checks.append("fixed exact-length test cases")
 
     trial = trials[0]
     layout = TapeLayout(config.geometry, trial.tape_slots)
@@ -66,7 +86,11 @@ def validate_experiment(
     occupied[layout.tape_row, layout.tape_slice] = True
     if bool((rendered[:, ~occupied] != 0).any()):
         raise AssertionError("tape rendering wrote outside logical positions")
-    checks.append("shared strided tape")
+    left = layout.tape_coordinates[0][1]
+    right = layout.width - 1 - layout.tape_coordinates[-1][1]
+    if left != right or left != config.geometry.horizontal_space:
+        raise AssertionError("tape boundary spaces are not symmetric")
+    checks.append("symmetric shared strided tape")
 
     values = torch.tensor(
         [
@@ -89,18 +113,20 @@ def validate_experiment(
     if not torch.equal(initial[:, : config.model.program_channels], programs):
         raise AssertionError("task programs were not injected")
     tile = model.programs[task_indices]
-    for offset in range(0, layout.width, config.geometry.stride):
-        if not torch.equal(
-            programs[..., offset : offset + config.geometry.stride], tile
-        ):
-            raise AssertionError("program tile does not repeat from absolute x=0")
+    start = config.geometry.program_start
+    if start == 1 and torch.count_nonzero(programs[..., 0]):
+        raise AssertionError("program origin column is not zero")
+    for column in range(start, layout.width):
+        phase = (column - start) % config.geometry.stride
+        if not torch.equal(programs[..., column], tile[..., phase]):
+            raise AssertionError("program tile does not repeat from its origin")
     if config.model.program_mode == "zero" and torch.count_nonzero(programs):
         raise AssertionError("zero program is not zero")
     if not torch.equal(initial[:, config.model.io_channel], rendered):
         raise AssertionError("input was not injected into the shared I/O channel")
     if not torch.equal(model(initial, 1)[:, 1], initial):
         raise AssertionError("zero-initialized update rule is not identity")
-    checks.append("periodic task program")
+    checks.append(f"periodic task program from x={start}")
 
     probe = NeuralCellularAutomaton(config.model, config.geometry, task_names)
     with torch.no_grad():

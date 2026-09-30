@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
 
@@ -137,6 +138,109 @@ def copy_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
     )
 
 
+def _transformed_task(
+    name: str,
+    max_length: int,
+    transform: Callable[[str], str],
+    *,
+    include_shorter: bool,
+) -> StringTask:
+    strings = binary_strings(
+        max_length,
+        include_shorter=include_shorter,
+        include_empty=include_shorter,
+    )
+    return StringTask(
+        name=name,
+        examples=tuple(StringExample(value, transform(value)) for value in strings),
+    )
+
+
+def reverse_not_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    return _transformed_task(
+        "reverse_not",
+        max_length,
+        lambda value: "".join("1" if bit == "0" else "0" for bit in value[::-1]),
+        include_shorter=include_shorter,
+    )
+
+
+def shift_left_zero_task(
+    max_length: int, *, include_shorter: bool = True
+) -> StringTask:
+    return _transformed_task(
+        "shift_left_zero",
+        max_length,
+        lambda value: value[1:] + "0" if value else "",
+        include_shorter=include_shorter,
+    )
+
+
+def shift_right_zero_task(
+    max_length: int, *, include_shorter: bool = True
+) -> StringTask:
+    return _transformed_task(
+        "shift_right_zero",
+        max_length,
+        lambda value: "0" + value[:-1] if value else "",
+        include_shorter=include_shorter,
+    )
+
+
+def _gray_encode(value: str) -> str:
+    if not value:
+        return ""
+    return value[0] + "".join(
+        "1" if left != right else "0" for left, right in zip(value, value[1:])
+    )
+
+
+def gray_encode_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    return _transformed_task(
+        "gray_encode",
+        max_length,
+        _gray_encode,
+        include_shorter=include_shorter,
+    )
+
+
+def _prefix_xor(value: str) -> str:
+    parity = 0
+    output = []
+    for bit in value:
+        parity ^= int(bit)
+        output.append(str(parity))
+    return "".join(output)
+
+
+def prefix_xor_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    return _transformed_task(
+        "prefix_xor",
+        max_length,
+        _prefix_xor,
+        include_shorter=include_shorter,
+    )
+
+
+def _increment(value: str) -> str:
+    bits = list(value)
+    for index in range(len(bits) - 1, -1, -1):
+        if bits[index] == "0":
+            bits[index] = "1"
+            break
+        bits[index] = "0"
+    return "".join(bits)
+
+
+def increment_task(max_length: int, *, include_shorter: bool = True) -> StringTask:
+    return _transformed_task(
+        "increment",
+        max_length,
+        _increment,
+        include_shorter=include_shorter,
+    )
+
+
 def append_task(
     max_length: int, bit: str, *, include_shorter: bool = True
 ) -> StringTask:
@@ -165,6 +269,12 @@ TASK_FACTORIES = {
     "copy": copy_task,
     "bit_not": bitwise_not_task,
     "reverse": reverse_task,
+    "reverse_not": reverse_not_task,
+    "shift_left_zero": shift_left_zero_task,
+    "shift_right_zero": shift_right_zero_task,
+    "gray_encode": gray_encode_task,
+    "prefix_xor": prefix_xor_task,
+    "increment": increment_task,
     "parity": parity_task,
     "append_0": append_zero_task,
     "append_1": append_one_task,
@@ -201,10 +311,17 @@ class TaskDataset:
     def from_task(cls, task: StringTask, tape_slots: int) -> "TaskDataset":
         inputs = tuple(example.input for example in task.examples)
         targets = tuple(example.target for example in task.examples)
-        if max(map(len, inputs)) > tape_slots:
-            raise ValueError("an input exceeds the configured tape capacity")
-        if max(map(len, targets)) > tape_slots:
-            raise ValueError("an output exceeds the configured tape capacity")
+        maximum_length = tape_slots - 1
+        if max(map(len, inputs)) > maximum_length:
+            raise ValueError(
+                f"task {task.name!r} has an input that does not leave one blank "
+                "tape cell"
+            )
+        if max(map(len, targets)) > maximum_length:
+            raise ValueError(
+                f"task {task.name!r} has an output that does not leave one blank "
+                "tape cell"
+            )
         return cls(
             name=task.name,
             output_mode=task.output_mode,

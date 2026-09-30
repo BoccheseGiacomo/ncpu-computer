@@ -29,18 +29,26 @@ def test_default_model_has_shared_io_and_zero_periodic_program():
     assert torch.count_nonzero(model.programs) == 0
 
 
-def test_program_repeats_from_absolute_zero_for_variable_tapes():
+@pytest.mark.parametrize("program_start", [0, 1])
+def test_program_repeats_from_configured_origin(program_start):
+    geometry = GeometryConfig(program_start=program_start)
     config = ModelConfig(program_channels=2, program_mode="learned_read_only")
-    model = make_model(config)
+    model = NeuralCellularAutomaton(config, geometry, TASKS)
     with torch.no_grad():
         model.programs.copy_(
             torch.arange(model.programs.numel()).reshape_as(model.programs)
         )
     for slots in (3, 8):
-        layout = TapeLayout(GEOMETRY, slots)
+        layout = TapeLayout(geometry, slots)
         grid = model.program_grid(torch.tensor([1]), layout.width)
-        for x in range(0, layout.width, GEOMETRY.stride):
-            assert torch.equal(grid[0, :, :, x : x + 2], model.programs[1])
+        if program_start == 1:
+            assert torch.count_nonzero(grid[..., 0]) == 0
+            assert (layout.width - 1) % geometry.stride == 0
+        for x in range(program_start, layout.width):
+            phase = (x - program_start) % geometry.stride
+            assert torch.equal(grid[0, :, :, x], model.programs[1, :, :, phase])
+        if program_start == 0:
+            assert layout.width % geometry.stride == 1
         state = model.initial_state(
             layout.render_tape(torch.ones(1, slots)), torch.tensor([1])
         )
@@ -57,11 +65,16 @@ def test_program_repeats_from_absolute_zero_for_variable_tapes():
 def test_program_mutability_modes(mode, changes):
     model = make_model(ModelConfig(program_mode=mode, max_abs_state=None))
     with torch.no_grad():
+        model.rule.hidden.weight.zero_()
+        model.rule.hidden.bias.fill_(1.0)
         model.rule.output.weight.fill_(0.1)
     layout = TapeLayout(GEOMETRY, 3)
     state = model.initial_state(layout.render_tape(torch.ones(1, 3)), torch.tensor([0]))
     updated = model.step(state)
     assert (not torch.equal(updated[:, :1], state[:, :1])) is changes
+    if mode == "learned_mutable":
+        assert torch.count_nonzero(state[:, :1, :, 0]) == 0
+        assert torch.count_nonzero(updated[:, :1, :, 0]) > 0
     assert not torch.equal(
         updated[:, model.config.io_channel], state[:, model.config.io_channel]
     )

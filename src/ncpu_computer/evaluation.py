@@ -288,10 +288,13 @@ def evaluate_cases(
     results = []
     for case in cases:
         case.validate()
-        datasets = MultiTaskDataset.from_tasks(
-            binary_tasks(task_names, case.input_length, include_shorter=False),
-            case.tape_slots,
-        )
+        try:
+            datasets = MultiTaskDataset.from_tasks(
+                binary_tasks(task_names, case.input_length, include_shorter=False),
+                case.tape_slots,
+            )
+        except ValueError as error:
+            raise ValueError(f"test case {case.name!r}: {error}") from error
         results.extend(
             evaluate_tasks(
                 model,

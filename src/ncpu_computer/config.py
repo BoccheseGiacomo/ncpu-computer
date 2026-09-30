@@ -8,6 +8,7 @@ from typing import Any
 SUPPORTED_FIXED_KERNELS = {"identity", "sobel_x", "sobel_y"}
 SUPPORTED_GATES = {"none", "linear", "sigmoid", "tanh", "relu"}
 PROGRAM_MODES = {"zero", "learned_read_only", "learned_mutable"}
+LR_INTERPOLATIONS = {"linear", "cosine"}
 
 
 @dataclass(frozen=True)
@@ -15,10 +16,16 @@ class GeometryConfig:
     stride: int = 2
     vertical_space: int = 1
     horizontal_space: int = 2
+    program_start: int = 1
     wrap_y: bool = False
 
     def validate(self) -> None:
-        values = (self.stride, self.vertical_space, self.horizontal_space)
+        values = (
+            self.stride,
+            self.vertical_space,
+            self.horizontal_space,
+            self.program_start,
+        )
         if any(type(value) is not int for value in values):
             raise TypeError("geometry dimensions must be integers")
         if self.stride < 1:
@@ -27,6 +34,8 @@ class GeometryConfig:
             raise ValueError("spaces cannot be negative")
         if self.horizontal_space % self.stride:
             raise ValueError("horizontal_space must be divisible by stride")
+        if self.program_start not in {0, 1}:
+            raise ValueError("program_start must be 0 or 1")
         if type(self.wrap_y) is not bool:
             raise TypeError("wrap_y must be a boolean")
 
@@ -151,17 +160,22 @@ class TestCase:
 class TrainingConfig:
     updates: int = 3000
     batch_size_per_task: int = 64
-    n_trials: int = 3
-    tape_slots_min: int = 8
-    tape_slots_max: int = 14
-    input_max_length_min: int = 2
-    input_max_length_max: int = 6
-    free_steps_min: int = 40
-    free_steps_max: int = 100
-    supervision_ratio: float = 1.6
-    learning_rate: float = 2e-3
-    final_learning_rate: float = 1e-4
-    warmup_updates: int = 0
+    base_tape_slots: tuple[int, ...] = (5, 7, 8, 9)
+    base_input_max_lengths: tuple[int, ...] = (3, 5, 6, 7)
+    tape_variation: float = 0.3
+    input_variation: float = 0.3
+    free_steps_per_tape_slot: float = 6.0
+    time_variation: float = 0.4
+    supervision_ratio: float = 1.5
+    lr_points: tuple[tuple[float, float], ...] = (
+        (0.0, 2e-3),
+        (0.35, 2e-3),
+        (0.60, 7e-4),
+        (0.75, 7e-4),
+        (0.95, 1e-4),
+        (1.0, 1e-4),
+    )
+    lr_interpolation: str = "cosine"
     weight_decay: float = 2e-5
     program_weight_decay: float = 1e-4
     grad_clip: float | None = 0.8
@@ -178,14 +192,6 @@ class TrainingConfig:
         integers = (
             self.updates,
             self.batch_size_per_task,
-            self.n_trials,
-            self.tape_slots_min,
-            self.tape_slots_max,
-            self.input_max_length_min,
-            self.input_max_length_max,
-            self.free_steps_min,
-            self.free_steps_max,
-            self.warmup_updates,
             self.seed,
             self.validation_every,
             self.checkpoint_every,
@@ -197,9 +203,11 @@ class TrainingConfig:
         ):
             raise TypeError("training flags must be booleans")
         numeric = (
+            self.tape_variation,
+            self.input_variation,
+            self.free_steps_per_tape_slot,
+            self.time_variation,
             self.supervision_ratio,
-            self.learning_rate,
-            self.final_learning_rate,
             self.weight_decay,
             self.program_weight_decay,
             self.perception_noise_start,
@@ -209,34 +217,38 @@ class TrainingConfig:
             numeric += (self.grad_clip,)
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("training scalar hyperparameters must be finite")
-        if self.updates < 1 or self.batch_size_per_task < 1 or self.n_trials < 1:
-            raise ValueError("updates, batch size, and n_trials must be positive")
-        ranges = (
-            (self.tape_slots_min, self.tape_slots_max, "tape slots"),
-            (self.input_max_length_min, self.input_max_length_max, "input length"),
-            (self.free_steps_min, self.free_steps_max, "free steps"),
+        if self.updates < 1 or self.batch_size_per_task < 1:
+            raise ValueError("updates and batch size must be positive")
+        if not self.base_tape_slots or (
+            len(self.base_tape_slots) != len(self.base_input_max_lengths)
+        ):
+            raise ValueError(
+                "base tape and input tuples must have equal nonzero length"
+            )
+        if any(type(value) is not int for value in self.base_tape_slots):
+            raise TypeError("base tape slots must be integers")
+        if any(type(value) is not int for value in self.base_input_max_lengths):
+            raise TypeError("base input lengths must be integers")
+        if any(value < 2 for value in self.base_tape_slots):
+            raise ValueError("base tape slots must be at least two")
+        if any(value < 0 for value in self.base_input_max_lengths):
+            raise ValueError("base input lengths cannot be negative")
+        if len(set(self.base_tape_slots)) != len(self.base_tape_slots):
+            raise ValueError("base tape slots must be unique")
+        if len(set(self.base_input_max_lengths)) != len(self.base_input_max_lengths):
+            raise ValueError("base input lengths must be unique")
+        variations = (
+            self.tape_variation,
+            self.input_variation,
+            self.time_variation,
         )
-        for lower, upper, name in ranges:
-            if lower < 0 or lower > upper:
-                raise ValueError(f"invalid {name} range")
-            if upper - lower + 1 < self.n_trials:
-                raise ValueError(
-                    f"{name} range cannot provide n_trials distinct values"
-                )
-        if self.tape_slots_min < 2:
-            raise ValueError("tape_slots_min must be at least two")
-        if self.free_steps_min < 1:
-            raise ValueError("free_steps_min must be positive")
+        if any(not 0 <= value < 1 for value in variations):
+            raise ValueError("variations must be in [0, 1)")
+        if self.free_steps_per_tape_slot <= 0:
+            raise ValueError("free_steps_per_tape_slot must be positive")
         if self.supervision_ratio <= 0:
             raise ValueError("supervision_ratio must be positive")
-        if round(self.supervision_ratio * self.free_steps_min) < 1:
-            raise ValueError("supervision_ratio produces an empty supervision window")
-        if self.input_max_length_max > self.tape_slots_max - 1:
-            raise ValueError("input range exceeds the largest feasible tape")
-        if self.learning_rate <= 0 or self.final_learning_rate <= 0:
-            raise ValueError("learning rates must be positive")
-        if not 0 <= self.warmup_updates < self.updates:
-            raise ValueError("warmup_updates must be in [0, updates)")
+        self._validate_lr_schedule()
         if self.weight_decay < 0 or self.program_weight_decay < 0:
             raise ValueError("weight decays cannot be negative")
         if self.grad_clip is not None and self.grad_clip <= 0:
@@ -252,6 +264,33 @@ class TrainingConfig:
         ):
             raise ValueError("device must be 'auto', 'cpu', or a CUDA device")
 
+    def _validate_lr_schedule(self) -> None:
+        if self.lr_interpolation not in LR_INTERPOLATIONS:
+            raise ValueError(
+                f"lr_interpolation must be one of {sorted(LR_INTERPOLATIONS)}"
+            )
+        if len(self.lr_points) < 2:
+            raise ValueError("lr_points must contain at least two anchors")
+        points = []
+        for point in self.lr_points:
+            if not isinstance(point, (tuple, list)) or len(point) != 2:
+                raise TypeError("each learning-rate anchor must be a pair")
+            progress, rate = point
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in point
+            ):
+                raise TypeError("learning-rate anchors must be numeric")
+            if not math.isfinite(progress) or not math.isfinite(rate):
+                raise ValueError("learning-rate anchors must be finite")
+            if rate <= 0:
+                raise ValueError("learning rates must be positive")
+            points.append((float(progress), float(rate)))
+        if points[0][0] != 0.0 or points[-1][0] != 1.0:
+            raise ValueError("lr_points must start at 0.0 and end at 1.0")
+        if any(right[0] <= left[0] for left, right in zip(points, points[1:])):
+            raise ValueError("learning-rate progress values must strictly increase")
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -259,9 +298,9 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     test_cases: tuple[TestCase, ...] = (
-        TestCase("in_distribution", 10, 6, 80, 128),
-        TestCase("longer_input", 10, 8, 100, 160),
-        TestCase("larger_grid", 14, 10, 130, 208),
+        TestCase("train_large", 9, 7, 54, 81),
+        TestCase("longer_tape", 13, 7, 78, 117),
+        TestCase("longer_tape_input", 13, 10, 78, 117),
     )
 
     def validate(self) -> None:
@@ -280,7 +319,7 @@ class ExperimentConfig:
             )
         if self.training.train_program and self.model.program_mode == "zero":
             raise ValueError("a zero program cannot be trained")
-        _validate_stratified_feasibility(self.training)
+        _validate_trial_feasibility(self.training)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -289,41 +328,57 @@ class ExperimentConfig:
     def from_dict(cls, data: dict[str, Any]) -> "ExperimentConfig":
         model_data = dict(data["model"])
         model_data["fixed_kernels"] = tuple(model_data["fixed_kernels"])
+        training_data = dict(data["training"])
+        training_data["base_tape_slots"] = tuple(training_data["base_tape_slots"])
+        training_data["base_input_max_lengths"] = tuple(
+            training_data["base_input_max_lengths"]
+        )
+        training_data["lr_points"] = tuple(
+            tuple(point) for point in training_data["lr_points"]
+        )
         config = cls(
             geometry=GeometryConfig(**data["geometry"]),
             model=ModelConfig(**model_data),
-            training=TrainingConfig(**data["training"]),
+            training=TrainingConfig(**training_data),
             test_cases=tuple(TestCase(**case) for case in data["test_cases"]),
         )
         config.validate()
         return config
 
 
-def integer_strata(lower: int, upper: int, count: int) -> tuple[tuple[int, int], ...]:
-    size = upper - lower + 1
-    if count < 1 or size < count:
-        raise ValueError("integer range cannot provide the requested distinct strata")
-    quotient, remainder = divmod(size, count)
-    result = []
-    start = lower
-    for index in range(count):
-        width = quotient + (index < remainder)
-        result.append((start, start + width - 1))
-        start += width
-    return tuple(result)
+def round_half_up(value: float) -> int:
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("round_half_up expects a finite non-negative value")
+    return math.floor(value + 0.5)
 
 
-def _validate_stratified_feasibility(training: TrainingConfig) -> None:
-    tape = integer_strata(
-        training.tape_slots_min, training.tape_slots_max, training.n_trials
+def varied_bounds(base: int, variation: float) -> tuple[int, int]:
+    return (
+        round_half_up(base * (1.0 - variation)),
+        round_half_up(base * (1.0 + variation)),
     )
-    inputs = integer_strata(
-        training.input_max_length_min,
-        training.input_max_length_max,
-        training.n_trials,
-    )
-    for (tape_low, tape_high), (input_low, _) in zip(tape, inputs):
-        if tape_low < input_low + 1:
+
+
+def _validate_trial_feasibility(training: TrainingConfig) -> None:
+    for base_tape, base_input in zip(
+        training.base_tape_slots, training.base_input_max_lengths
+    ):
+        if base_input > base_tape - 1:
+            raise ValueError("every base input must leave one blank tape cell")
+        tape_low, _ = varied_bounds(base_tape, training.tape_variation)
+        input_low, _ = varied_bounds(base_input, training.input_variation)
+        if tape_low < 2:
+            raise ValueError("tape variation can produce fewer than two slots")
+        if input_low > tape_low - 1:
             raise ValueError(
-                "every tape value must fit its coupled input stratum and one blank"
+                "input variation has no feasible value for every sampled tape"
             )
+        minimum_steps = round_half_up(
+            training.free_steps_per_tape_slot
+            * tape_low
+            * (1.0 - training.time_variation)
+        )
+        if minimum_steps < 1:
+            raise ValueError("time variation can produce zero free steps")
+        if round_half_up(training.supervision_ratio * minimum_steps) < 1:
+            raise ValueError("supervision_ratio can produce an empty window")

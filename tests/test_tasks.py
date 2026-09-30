@@ -61,8 +61,52 @@ def test_binary_tasks_include_empty_and_all_shorter_strings_in_order():
     )
 
 
+def test_length_preserving_programmed_tasks_have_exact_transformations():
+    names = (
+        "copy",
+        "bit_not",
+        "reverse",
+        "reverse_not",
+        "shift_left_zero",
+        "shift_right_zero",
+        "gray_encode",
+        "prefix_xor",
+        "increment",
+    )
+    tasks = binary_tasks(names, 4, include_shorter=False)
+    assert {
+        task.name: next(
+            example.target for example in task.examples if example.input == "1011"
+        )
+        for task in tasks
+    } == {
+        "copy": "1011",
+        "bit_not": "0100",
+        "reverse": "1101",
+        "reverse_not": "0010",
+        "shift_left_zero": "0110",
+        "shift_right_zero": "0101",
+        "gray_encode": "1110",
+        "prefix_xor": "1101",
+        "increment": "1100",
+    }
+    assert all(
+        task.examples == (StringExample("", ""),) for task in binary_tasks(names, 0)
+    )
+
+
 def test_programmed_tasks_share_inputs_and_balanced_batches():
-    names = ("copy", "bit_not", "reverse", "parity", "append_0", "append_1")
+    names = (
+        "copy",
+        "bit_not",
+        "reverse",
+        "reverse_not",
+        "shift_left_zero",
+        "shift_right_zero",
+        "gray_encode",
+        "prefix_xor",
+        "increment",
+    )
     tasks = binary_tasks(names, 2)
     datasets = MultiTaskDataset.from_tasks(tasks, tape_slots=4)
     assert datasets.task_names == names
@@ -72,15 +116,15 @@ def test_programmed_tasks_share_inputs_and_balanced_batches():
     )
     batch = datasets.balanced_sample(3, torch.Generator().manual_seed(4))
     inputs, targets, lengths, task_indices = batch
-    assert inputs.shape == targets.shape == (18, 4)
-    assert lengths.shape == task_indices.shape == (18,)
-    assert torch.bincount(task_indices, minlength=6).tolist() == [3] * 6
-    assert set(task_indices.tolist()) == set(range(6))
+    assert inputs.shape == targets.shape == (27, 4)
+    assert lengths.shape == task_indices.shape == (27,)
+    assert torch.bincount(task_indices, minlength=9).tolist() == [3] * 9
+    assert set(task_indices.tolist()) == set(range(9))
 
 
 def test_append_capacity_is_checked_without_automatic_expansion():
     with pytest.raises(ValueError, match="output"):
-        TaskDataset.from_task(append_zero_task(3), tape_slots=3)
+        TaskDataset.from_task(append_zero_task(2), tape_slots=3)
 
 
 def test_exact_length_tasks_exclude_empty_and_shorter_strings():
@@ -111,17 +155,15 @@ def test_dataset_uses_direct_values_and_blank_fills_full_capacity():
     assert dataset.target_lengths.tolist() == [2, 0]
 
 
-def test_full_length_output_needs_no_extra_terminator_slot():
-    dataset = TaskDataset.from_task(
-        StringTask("copy", (StringExample("111", "111"),)), tape_slots=3
-    )
-    prediction = dataset.targets.to(torch.int8)
-    assert semantic_correct(
-        prediction,
-        dataset.targets.to(torch.int8),
-        dataset.target_lengths,
-        "single",
-    ).item()
+def test_full_length_input_and_output_must_leave_one_blank():
+    with pytest.raises(ValueError, match="input"):
+        TaskDataset.from_task(
+            StringTask("copy", (StringExample("111", "11"),)), tape_slots=3
+        )
+    with pytest.raises(ValueError, match="output"):
+        TaskDataset.from_task(
+            StringTask("append", (StringExample("11", "111"),)), tape_slots=3
+        )
 
 
 def test_semantic_correct_requires_available_blank_but_ignores_later_tail():

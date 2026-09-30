@@ -128,7 +128,11 @@ class TapeLayout:
 
     @property
     def width(self) -> int:
-        return 2 * self.config.horizontal_space + self.tape_slots * self.config.stride
+        return (
+            2 * self.config.horizontal_space
+            + (self.tape_slots - 1) * self.config.stride
+            + 1
+        )
 
     @property
     def tape_row(self) -> int:
@@ -136,7 +140,7 @@ class TapeLayout:
 
     @property
     def tape_start(self) -> int:
-        return self.config.horizontal_space + self.config.stride // 2
+        return self.config.horizontal_space
 
     @property
     def tape_slice(self) -> slice:

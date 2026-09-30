@@ -13,11 +13,16 @@ from ncpu_computer import (
     TrainingConfig,
     evaluate_cases,
     infer,
+    learning_rate_at,
     load_model,
     perception_noise,
     sample_trials,
     supervised_loss,
+    validate_task_specs,
 )
+
+
+TASK_SPECS = (("copy", 1.0), ("bit_not", 1.0))
 
 
 def tiny_config(
@@ -36,13 +41,12 @@ def tiny_config(
         training=TrainingConfig(
             updates=updates,
             batch_size_per_task=2,
-            n_trials=2,
-            tape_slots_min=3,
-            tape_slots_max=4,
-            input_max_length_min=1,
-            input_max_length_max=2,
-            free_steps_min=1,
-            free_steps_max=2,
+            base_tape_slots=(3, 4),
+            base_input_max_lengths=(1, 2),
+            tape_variation=0.0,
+            input_variation=0.0,
+            free_steps_per_tape_slot=0.4,
+            time_variation=0.0,
             supervision_ratio=1.0,
             train_rule=train_rule,
             train_program=train_program,
@@ -54,21 +58,44 @@ def tiny_config(
     )
 
 
-def test_stratified_trials_are_unique_coupled_and_reproducible():
+def test_paired_trials_are_tape_timed_and_reproducible():
     config = tiny_config().training
-    first = sample_trials(config, torch.Generator().manual_seed(9))
-    second = sample_trials(config, torch.Generator().manual_seed(9))
+    first = sample_trials(config, ("copy",), torch.Generator().manual_seed(9))
+    second = sample_trials(config, ("copy",), torch.Generator().manual_seed(9))
     assert first == second
-    assert len({trial.tape_slots for trial in first}) == 2
-    assert len({trial.input_max_length for trial in first}) == 2
-    assert len({trial.free_steps for trial in first}) == 2
+    assert {(trial.tape_slots, trial.input_max_length) for trial in first} == {
+        (3, 1),
+        (4, 2),
+    }
     assert all(trial.input_max_length <= trial.tape_slots - 1 for trial in first)
-    ranked = sorted(first, key=lambda trial: trial.tape_slots)
-    assert ranked[0].input_max_length < ranked[1].input_max_length
-    assert ranked[0].free_steps < ranked[1].free_steps
+    assert sorted(trial.free_steps for trial in first) == [1, 2]
 
 
-def test_supervised_loss_uses_every_tape_cell_and_equal_task_means():
+def test_invalid_input_resamples_without_resampling_tape(monkeypatch):
+    import ncpu_computer.training as training_module
+
+    config = replace(
+        tiny_config().training,
+        base_tape_slots=(4,),
+        base_input_max_lengths=(2,),
+        tape_variation=0.25,
+        input_variation=0.5,
+        free_steps_per_tape_slot=2.0,
+    )
+    values = iter((3, 3, 1, 6))
+    bases = []
+
+    def fake_sample(base, variation, generator):
+        bases.append(base)
+        return next(values)
+
+    monkeypatch.setattr(training_module, "_sample_varied", fake_sample)
+    trial = sample_trials(config, ("append_0",), torch.Generator().manual_seed(0))[0]
+    assert bases == [4, 2, 2, 6.0]
+    assert trial == training_module.TrialSpec(3, 1, 6, 6)
+
+
+def test_supervised_loss_uses_every_tape_cell_and_weighted_task_means():
     layout = TapeLayout(GeometryConfig(), 2)
     rollout = torch.zeros(3, 2, 3, layout.height, layout.width)
     rollout[0, 1, 1, layout.tape_row, layout.tape_slice] = 1.0
@@ -83,13 +110,28 @@ def test_supervised_loss_uses_every_tape_cell_and_equal_task_means():
         1,
         torch.tensor([0, 1, 1]),
         2,
+        (1.0, 3.0),
     )
     assert losses.per_task.tolist() == pytest.approx([1.0, 9.0])
-    assert float(losses.total) == pytest.approx(5.0)
+    assert float(losses.total) == pytest.approx(7.0)
+
+
+def test_task_specs_require_unique_names_and_positive_finite_weights():
+    assert validate_task_specs((("copy", 1), ("reverse", 2.0))) == (
+        ("copy", "reverse"),
+        (1.0, 2.0),
+    )
+    for specs in (
+        (("copy", 0.0),),
+        (("copy", float("inf")),),
+        (("copy", 1.0), ("copy", 2.0)),
+    ):
+        with pytest.raises(ValueError):
+            validate_task_specs(specs)
 
 
 def test_training_accumulates_trials_and_optimizer_respects_modes():
-    rule_only = Trainer(tiny_config(), ("copy", "bit_not"))
+    rule_only = Trainer(tiny_config(), TASK_SPECS)
     metrics = rule_only.train_step()
     assert len(metrics.trials) == 2
     assert [group["name"] for group in rule_only.optimizer.param_groups] == ["rule"]
@@ -100,7 +142,7 @@ def test_training_accumulates_trials_and_optimizer_respects_modes():
     program_config = tiny_config(
         mode="learned_read_only", train_rule=False, train_program=True
     )
-    program_only = Trainer(program_config, ("copy", "bit_not"))
+    program_only = Trainer(program_config, TASK_SPECS)
     with torch.no_grad():
         program_only.model.rule.hidden.weight.fill_(0.1)
         program_only.model.rule.hidden.bias.fill_(0.1)
@@ -114,7 +156,7 @@ def test_training_accumulates_trials_and_optimizer_respects_modes():
 
     joint = Trainer(
         tiny_config(mode="learned_mutable", train_rule=True, train_program=True),
-        ("copy", "bit_not"),
+        TASK_SPECS,
     )
     assert [group["name"] for group in joint.optimizer.param_groups] == [
         "rule",
@@ -139,6 +181,46 @@ def test_noise_anneals_linearly():
     )
 
 
+def test_staged_cosine_schedule_hits_every_anchor_and_plateau():
+    training = replace(
+        tiny_config(updates=101).training,
+        lr_points=TrainingConfig().lr_points,
+    )
+    expected = {
+        0: 2e-3,
+        35: 2e-3,
+        60: 7e-4,
+        75: 7e-4,
+        95: 1e-4,
+        100: 1e-4,
+    }
+    assert {
+        update: learning_rate_at(training, update) for update in expected
+    } == pytest.approx(expected)
+
+
+def test_linear_schedule_supports_growth_and_decay():
+    training = replace(
+        tiny_config(updates=5).training,
+        lr_points=((0.0, 1.0), (0.5, 3.0), (1.0, 1.0)),
+        lr_interpolation="linear",
+    )
+    assert [learning_rate_at(training, update) for update in range(5)] == pytest.approx(
+        [1.0, 2.0, 3.0, 2.0, 1.0]
+    )
+
+
+def test_cosine_schedule_smoothly_interpolates_between_anchors():
+    training = replace(
+        tiny_config(updates=5).training,
+        lr_points=((0.0, 1.0), (1.0, 3.0)),
+        lr_interpolation="cosine",
+    )
+    assert [learning_rate_at(training, update) for update in range(5)] == pytest.approx(
+        [1.0, 1.0 + (1.0 - 2**-0.5), 2.0, 2.0 + 2**-0.5, 3.0]
+    )
+
+
 def test_checkpoint_resume_matches_uninterrupted_training(tmp_path):
     config = replace(
         tiny_config(fire_rate=0.5),
@@ -148,15 +230,16 @@ def test_checkpoint_resume_matches_uninterrupted_training(tmp_path):
             perception_noise_end=0.01,
         ),
     )
-    names = ("copy", "bit_not")
-    uninterrupted = Trainer(config, names)
+    uninterrupted = Trainer(config, TASK_SPECS)
     uninterrupted.train_step()
     expected_second = uninterrupted.train_step()
-    interrupted = Trainer(config, names)
+    interrupted = Trainer(config, TASK_SPECS)
     interrupted.train_step()
     path = tmp_path / "resume.pt"
     interrupted.save(path)
-    resumed = Trainer.from_checkpoint(path, names, device="cpu")
+    with pytest.raises(ValueError, match="task specs do not match"):
+        Trainer.from_checkpoint(path, (("copy", 1.0), ("bit_not", 2.0)), device="cpu")
+    resumed = Trainer.from_checkpoint(path, TASK_SPECS, device="cpu")
     actual_second = resumed.train_step()
     assert actual_second.trials == expected_second.trials
     assert actual_second.loss == pytest.approx(expected_second.loss)
@@ -168,12 +251,17 @@ def test_checkpoint_resume_matches_uninterrupted_training(tmp_path):
 
 def test_checkpoint_and_variable_case_evaluation(tmp_path):
     config = tiny_config(updates=1)
-    trainer = Trainer(config, ("copy", "bit_not"))
+    trainer = Trainer(config, TASK_SPECS)
     trainer.fit(tmp_path, progress_every=1)
     model, loaded, checkpoint = load_model(tmp_path / "best.pt", "cpu")
     assert loaded == config
-    assert checkpoint["format_version"] == 5
+    assert checkpoint["format_version"] == 8
+    assert checkpoint["task_specs"] == TASK_SPECS
     assert len(checkpoint["task_signatures"]) == 2
+    assert set(trainer.history[-1]["validation_accuracies"]) == {
+        "copy",
+        "bit_not",
+    }
     results = evaluate_cases(
         model,
         config.geometry,

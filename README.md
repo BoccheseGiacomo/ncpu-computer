@@ -66,16 +66,18 @@ sides:
 
 ~~~text
 height = 2 * vertical_space + 1
-width  = 2 * horizontal_space + N * stride
+width  = 2 * horizontal_space + (N - 1) * stride + 1
 
-. . . . . . . . . . . .
-. . . T . T . T . T . .
-. . . . . . . . . . . .
+. . . . . . . . . . .
+. . T . T . T . T . .
+. . . . . . . . . . .
 ~~~
 
-For the default stride 2, each T is the right-middle cell of its two-column
-stride block. Only these logical cells are injected and supervised; all other
-cells are working space. Horizontal perception always uses zero padding.
+More precisely, logical cell `i` is at `horizontal_space + i * stride`.
+
+The first and last tape cells therefore have exactly `horizontal_space`
+physical columns outside them. Only logical cells are injected and supervised;
+all other cells are working space. Horizontal perception always uses zero padding.
 Vertical perception can use either zero padding or circular wrapping.
 Horizontal wrapping is never used.
 
@@ -96,15 +98,19 @@ A task program is a small tile with shape:
 program_channels x grid_height x stride
 ~~~
 
-It starts at absolute horizontal coordinate zero and repeats across the full
-grid, including the boundary space:
+Its configurable origin is either absolute horizontal coordinate zero or one.
+With the default origin `1`, column zero is initialized to zero and complete
+tiles repeat from column one:
 
 ~~~text
-program[:, y, x] = tile[:, y, x % stride]
+0 | tile | tile | tile | ...
 ~~~
 
+Origin `0` instead repeats from the first grid column; because the symmetric
+grid has odd width at the default stride, the last repetition can be partial.
 Tiles are adjacent and never overlap. Their parameter count is independent of
-tape capacity, and every tape cell sees the same program phase.
+tape capacity. In mutable mode, the leading zero column is only an initial
+condition and may evolve normally.
 
 Three modes are available:
 
@@ -137,10 +143,20 @@ is zero throughout, so no noise tensor is generated.
 
 ## Variable-shape training
 
-One optimizer update contains N_TRIALS sequential trials. Each trial has its
-own tape capacity, maximum input length, and computation time. Values are
-sampled from coupled non-overlapping strata, so a default three-trial update
-contains distinct small, medium, and large cases.
+One optimizer update contains one sequential trial for each paired base case.
+The defaults are:
+
+~~~text
+tape slots        5  7  8  9
+max input length  3  5  6  7
+~~~
+
+At every update, tape capacity and maximum input length receive independent
+uniform percentage perturbations (±30% by default), each rounded with
+`floor(x + 0.5)`. A sampled pair is accepted only when every active task leaves
+at least one blank after both its input and output. If it does not, the tape
+capacity is retained and only the input-length draw is repeated. Trial order is
+then shuffled.
 
 For each trial:
 
@@ -148,36 +164,68 @@ For each trial:
 2. Sample the same batch size for every enabled task.
 3. Run the trial on its own unpadded grid.
 4. Average MSE over tasks, examples, supervised times, and all tape cells.
-5. Backpropagate trial_loss / N_TRIALS immediately.
+5. Backpropagate `trial_loss / number_of_base_pairs` immediately.
 
 After all trials, gradients are clipped once and the optimizer steps once.
 Different shapes are never padded or masked into one batch, and only the
 largest individual trial graph needs to be resident at a time.
 
-The free-evolution time is resampled on every update. The supervision-window
-length is round(supervision_ratio * free_steps); the default ratio is 1.6. The
-complete configured ranges are active from the first update.
+Free-evolution time is proportional to the sampled tape capacity, then receives
+its own independent uniform perturbation:
+
+~~~text
+free_steps = round_half_up(steps_per_tape_slot * sampled_tape_slots * (1 + delta))
+~~~
+
+The defaults are 6 steps per tape slot, ±40% time variation, and a supervision
+window of `round_half_up(1.5 * free_steps)`. Thus geometry, data length, and
+available computation vary independently while computation remains scaled to
+the actual tape.
+
+Learning rate is defined by progress/rate anchors and either linear or cosine
+interpolation. Repeating a rate across consecutive anchors creates a plateau;
+changing it creates a transition. The default staged cosine schedule is:
+
+~~~text
+(0.00, 2.0e-3)  (0.35, 2.0e-3)
+(0.60, 7.0e-4)  (0.75, 7.0e-4)
+(0.95, 1.0e-4)  (1.00, 1.0e-4)
+~~~
+
+Cosine interpolation has zero slope at every anchor, so plateau transitions
+are smooth. The same representation supports linear decay, warmup, or a
+deliberate increase without a separate scheduler.
 
 ## Tasks and evaluation
 
 Built-in string tasks are:
 
 ~~~text
-copy       101 -> 101
-bit_not    101 -> 010
-reverse    101 -> 101
-parity     101 -> 0
-append_0   101 -> 1010
-append_1   101 -> 1011
+copy              1011 -> 1011
+bit_not           1011 -> 0100
+reverse           1011 -> 1101
+reverse_not       1011 -> 0010
+shift_left_zero   1011 -> 0110
+shift_right_zero  1011 -> 0101
+gray_encode       1011 -> 1110
+prefix_xor        1011 -> 1101
+increment         1011 -> 1100
+parity            1011 -> 1
+append_0          1011 -> 10110
+append_1          1011 -> 10111
 ~~~
 
-The notebook defaults to one task, while the library supports balanced
-multi-task batches, one tile per task, and one shared rule.
+The notebook defaults to the nine length-preserving tasks from `copy` through
+`increment`. Multi-task batches are balanced, with one learned tile per task
+and one shared update rule.
 
 Evaluation uses explicit deterministic cases. Each case specifies tape
-capacity, exact input length, free steps, and supervised steps. Reports include
-MSE, symbol accuracy, exact full-tape accuracy, interpreted semantic accuracy,
-stability across the supervision window, and best-timestep statistics.
+capacity, exact input length, free steps, and supervised steps. Only binary
+strings of exactly that input length are evaluated; shorter strings are not
+included. Cases are never capped, truncated, or resampled, and an input or
+output that does not leave one blank is an error. Reports include MSE, symbol
+accuracy, exact full-tape accuracy, interpreted semantic accuracy, stability
+across the supervision window, and best-timestep statistics.
 
 ## Running experiments
 
@@ -203,7 +251,7 @@ organized as follows:
 The GIF shows only the evolving shared I/O channel on a fixed [-1, +1] scale,
 with the selected task's initial program tile displayed separately.
 
-Checkpoint format 5 stores the full configuration, ordered task signatures,
+Checkpoint format 7 stores the full configuration, ordered task signatures,
 model, program, optimizer groups, progress, history, and all random-generator states.
 Resuming reproduces trial sampling, batches, firing masks, and perception
 noise. Older formats are intentionally rejected.

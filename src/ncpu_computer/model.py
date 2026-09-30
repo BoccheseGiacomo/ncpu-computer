@@ -179,11 +179,11 @@ class NeuralCellularAutomaton(nn.Module):
             raise ValueError(f"unknown task: {task_name!r}") from error
 
     def _validate_grid_shape(self, height: int, width: int) -> None:
-        usable = width - 2 * self.geometry.horizontal_space
+        tape_span = width - 2 * self.geometry.horizontal_space - 1
         if (
             height != self.geometry.height
-            or usable < self.geometry.stride
-            or usable % self.geometry.stride
+            or tape_span < 0
+            or tape_span % self.geometry.stride
         ):
             raise ValueError("grid shape is incompatible with the model geometry")
 
@@ -197,7 +197,13 @@ class NeuralCellularAutomaton(nn.Module):
         if bool(((task_indices < 0) | (task_indices >= len(self.task_names))).any()):
             raise ValueError("task index is out of range")
         selected = self.programs[task_indices]
-        return selected.repeat(1, 1, 1, width // self.geometry.stride)
+        start = self.geometry.program_start
+        repetitions = (width - start + self.geometry.stride - 1) // self.geometry.stride
+        repeated = selected.repeat(1, 1, 1, repetitions)[..., : width - start]
+        if start == 0:
+            return repeated
+        leading = selected.new_zeros(*selected.shape[:-1], 1)
+        return torch.cat((leading, repeated), dim=-1)
 
     def initial_state(
         self, input_grid: torch.Tensor, task_indices: torch.Tensor

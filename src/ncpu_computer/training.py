@@ -4,18 +4,96 @@ import math
 import random
 import shutil
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
 import torch
 
-from .config import ExperimentConfig, TrainingConfig, integer_strata
+from .config import (
+    ExperimentConfig,
+    TrainingConfig,
+    round_half_up,
+    varied_bounds,
+)
 from .model import NeuralCellularAutomaton
 from .tape import TapeLayout, quantize
-from .tasks import MultiTaskDataset, binary_tasks, semantic_correct
+from .tasks import MultiTaskDataset, StringTask, binary_tasks, semantic_correct
 
 
-CHECKPOINT_FORMAT = 5
+CHECKPOINT_FORMAT = 8
+
+
+def validate_task_specs(
+    task_specs: tuple[tuple[str, float], ...],
+) -> tuple[tuple[str, ...], tuple[float, ...]]:
+    if not task_specs:
+        raise ValueError("task specs must not be empty")
+    names = []
+    weights = []
+    for spec in task_specs:
+        if not isinstance(spec, tuple) or len(spec) != 2:
+            raise ValueError("each task spec must be a (name, weight) tuple")
+        name, weight = spec
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ValueError("task weights must be numbers")
+        weight = float(weight)
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError("task weights must be finite and positive")
+        names.append(name)
+        weights.append(weight)
+    task_names = tuple(names)
+    binary_tasks(task_names, 0)
+    return task_names, tuple(weights)
+
+
+def _tasks_fit_tape(tasks: tuple[StringTask, ...], tape_slots: int) -> bool:
+    maximum_length = tape_slots - 1
+    return all(
+        len(example.input) <= maximum_length and len(example.target) <= maximum_length
+        for task in tasks
+        for example in task.examples
+    )
+
+
+@lru_cache(maxsize=None)
+def _training_pair_fits(
+    task_names: tuple[str, ...], input_max_length: int, tape_slots: int
+) -> bool:
+    return _tasks_fit_tape(binary_tasks(task_names, input_max_length), tape_slots)
+
+
+def _input_bounds(training: TrainingConfig, base_input: int) -> range:
+    low, high = varied_bounds(base_input, training.input_variation)
+    return range(low, high + 1)
+
+
+def _validate_task_feasibility(
+    training: TrainingConfig, task_names: tuple[str, ...]
+) -> None:
+    training.validate()
+    binary_tasks(task_names, 0)
+    for base_tape, base_input in zip(
+        training.base_tape_slots, training.base_input_max_lengths
+    ):
+        if not _training_pair_fits(task_names, base_input, base_tape):
+            raise ValueError(
+                f"base training/validation pair tape={base_tape}, "
+                f"input={base_input} does not leave one blank input and output "
+                "cell for every task"
+            )
+        tape_low, tape_high = varied_bounds(base_tape, training.tape_variation)
+        candidates = _input_bounds(training, base_input)
+        for tape_slots in range(tape_low, tape_high + 1):
+            if not any(
+                _training_pair_fits(task_names, input_max, tape_slots)
+                for input_max in candidates
+            ):
+                raise ValueError(
+                    f"sampled tape capacity {tape_slots} has no feasible input "
+                    "length that leaves one blank input and output cell for "
+                    "every task"
+                )
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -30,9 +108,29 @@ def resolve_device(requested: str) -> torch.device:
 def _task_signatures(
     config: ExperimentConfig, task_names: tuple[str, ...]
 ) -> tuple[str, ...]:
+    _validate_task_feasibility(config.training, task_names)
+    tape_bounds = tuple(
+        varied_bounds(base, config.training.tape_variation)
+        for base in config.training.base_tape_slots
+    )
+    input_bounds = tuple(
+        varied_bounds(base, config.training.input_variation)
+        for base in config.training.base_input_max_lengths
+    )
+    feasible_inputs = [
+        input_max
+        for (tape_low, tape_high), (input_low, input_high) in zip(
+            tape_bounds, input_bounds
+        )
+        for tape_slots in range(tape_low, tape_high + 1)
+        for input_max in range(input_low, input_high + 1)
+        if _training_pair_fits(task_names, input_max, tape_slots)
+    ]
+    maximum_input = max(feasible_inputs)
+    maximum_tape = max(high for _, high in tape_bounds)
     datasets = MultiTaskDataset.from_tasks(
-        binary_tasks(task_names, config.training.input_max_length_max),
-        config.training.tape_slots_max,
+        binary_tasks(task_names, maximum_input),
+        maximum_tape,
     )
     return datasets.signatures
 
@@ -49,67 +147,53 @@ class TrialSpec:
         return self.free_steps + self.supervision_steps
 
 
-def _sample_integer(lower: int, upper: int, generator: torch.Generator) -> int:
-    return int(torch.randint(lower, upper + 1, (), generator=generator))
+def _sample_varied(
+    base: int | float, variation: float, generator: torch.Generator
+) -> int:
+    delta = (2.0 * float(torch.rand((), generator=generator)) - 1.0) * variation
+    return round_half_up(base * (1.0 + delta))
 
 
 def sample_trials(
-    training: TrainingConfig, generator: torch.Generator
+    training: TrainingConfig,
+    task_names: tuple[str, ...],
+    generator: torch.Generator,
 ) -> tuple[TrialSpec, ...]:
-    training.validate()
-    tape_strata = integer_strata(
-        training.tape_slots_min, training.tape_slots_max, training.n_trials
-    )
-    input_strata = integer_strata(
-        training.input_max_length_min,
-        training.input_max_length_max,
-        training.n_trials,
-    )
-    time_strata = integer_strata(
-        training.free_steps_min, training.free_steps_max, training.n_trials
-    )
+    _validate_task_feasibility(training, task_names)
     trials = []
-    for tape_range, input_range, time_range in zip(
-        tape_strata, input_strata, time_strata
+    for base_tape, base_input in zip(
+        training.base_tape_slots, training.base_input_max_lengths
     ):
-        if tape_range[0] < input_range[0] + 1:
-            raise ValueError("coupled tape/input strata have no feasible sample")
-        tape_slots = _sample_integer(*tape_range, generator)
-        input_high = min(input_range[1], tape_slots - 1)
-        input_max = _sample_integer(input_range[0], input_high, generator)
-        free_steps = _sample_integer(*time_range, generator)
-        supervision_steps = round(training.supervision_ratio * free_steps)
+        tape_slots = _sample_varied(base_tape, training.tape_variation, generator)
+        input_max = _sample_varied(base_input, training.input_variation, generator)
+        while not _training_pair_fits(task_names, input_max, tape_slots):
+            input_max = _sample_varied(base_input, training.input_variation, generator)
+        free_steps = _sample_varied(
+            training.free_steps_per_tape_slot * tape_slots,
+            training.time_variation,
+            generator,
+        )
+        supervision_steps = round_half_up(training.supervision_ratio * free_steps)
         trials.append(TrialSpec(tape_slots, input_max, free_steps, supervision_steps))
-    order = torch.randperm(training.n_trials, generator=generator).tolist()
+    order = torch.randperm(len(trials), generator=generator).tolist()
     return tuple(trials[index] for index in order)
 
 
-def validation_trials(training: TrainingConfig) -> tuple[TrialSpec, ...]:
-    training.validate()
-    tape_strata = integer_strata(
-        training.tape_slots_min, training.tape_slots_max, training.n_trials
-    )
-    input_strata = integer_strata(
-        training.input_max_length_min,
-        training.input_max_length_max,
-        training.n_trials,
-    )
-    time_strata = integer_strata(
-        training.free_steps_min, training.free_steps_max, training.n_trials
-    )
+def validation_trials(
+    training: TrainingConfig, task_names: tuple[str, ...]
+) -> tuple[TrialSpec, ...]:
+    _validate_task_feasibility(training, task_names)
     trials = []
-    for tape_range, input_range, time_range in zip(
-        tape_strata, input_strata, time_strata
+    for tape_slots, input_max in zip(
+        training.base_tape_slots, training.base_input_max_lengths
     ):
-        tape_slots = sum(tape_range) // 2
-        input_max = min(sum(input_range) // 2, tape_slots - 1)
-        free_steps = sum(time_range) // 2
+        free_steps = round_half_up(training.free_steps_per_tape_slot * tape_slots)
         trials.append(
             TrialSpec(
                 tape_slots,
                 input_max,
                 free_steps,
-                round(training.supervision_ratio * free_steps),
+                round_half_up(training.supervision_ratio * free_steps),
             )
         )
     return tuple(trials)
@@ -131,6 +215,7 @@ def supervised_loss(
     supervision_steps: int,
     task_indices: torch.Tensor | None = None,
     task_count: int | None = None,
+    task_weights: tuple[float, ...] | None = None,
 ) -> LossComponents:
     start = free_steps + 1
     end = start + supervision_steps
@@ -151,8 +236,8 @@ def supervised_loss(
         .mean(dim=(1, 2))
     )
     if task_indices is None:
-        if task_count is not None:
-            raise ValueError("task_count requires task_indices")
+        if task_count is not None or task_weights is not None:
+            raise ValueError("task_count and task_weights require task_indices")
         per_task = per_example.mean().reshape(1)
     else:
         task_indices = torch.as_tensor(
@@ -171,24 +256,33 @@ def supervised_loss(
                 raise ValueError("every task must occur in a balanced batch")
             values.append(selected.mean())
         per_task = torch.stack(values)
-    base = per_task.mean()
+    if task_weights is None:
+        base = per_task.mean()
+    else:
+        weights = torch.as_tensor(
+            task_weights, dtype=per_task.dtype, device=per_task.device
+        )
+        if weights.shape != (len(per_task),):
+            raise ValueError("task_weights must contain one weight per task")
+        if not bool(torch.isfinite(weights).all()) or bool((weights <= 0).any()):
+            raise ValueError("task weights must be finite and positive")
+        base = (per_task * weights).sum() / weights.sum()
     return LossComponents(base, base, per_task)
 
 
-def cosine_learning_rate(config: ExperimentConfig, update: int) -> float:
-    training = config.training
+def learning_rate_at(training: TrainingConfig, update: int) -> float:
     if not 0 <= update < training.updates:
         raise ValueError("update must be in [0, updates)")
-    if training.warmup_updates and update < training.warmup_updates:
-        return training.learning_rate * (update + 1) / training.warmup_updates
-    decay_updates = training.updates - training.warmup_updates
-    decay_index = update - training.warmup_updates
-    progress = 1.0 if decay_updates == 1 else decay_index / (decay_updates - 1)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return (
-        training.final_learning_rate
-        + (training.learning_rate - training.final_learning_rate) * cosine
-    )
+    progress = 0.0 if training.updates == 1 else update / (training.updates - 1)
+    for (start, start_rate), (end, end_rate) in zip(
+        training.lr_points, training.lr_points[1:]
+    ):
+        if progress <= end:
+            fraction = (progress - start) / (end - start)
+            if training.lr_interpolation == "cosine":
+                fraction = 0.5 * (1.0 - math.cos(math.pi * fraction))
+            return start_rate + (end_rate - start_rate) * fraction
+    raise RuntimeError("learning-rate schedule does not cover training progress")
 
 
 def perception_noise(config: TrainingConfig, update: int) -> float:
@@ -209,11 +303,21 @@ class StepMetrics:
     raw_accuracy: float
     trials: tuple[TrialSpec, ...]
     validation_loss: float | None = None
+    validation_accuracies: dict[str, float] | None = None
 
     def to_dict(self) -> dict:
         data = self.__dict__.copy()
         data["trials"] = [asdict(trial) for trial in self.trials]
+        if self.validation_accuracies is not None:
+            data["validation_accuracies"] = dict(self.validation_accuracies)
         return data
+
+
+@dataclass(frozen=True)
+class ValidationMetrics:
+    loss: float
+    task_losses: dict[str, float]
+    task_accuracies: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -228,13 +332,17 @@ class Trainer:
     def __init__(
         self,
         config: ExperimentConfig,
-        task_names: tuple[str, ...],
+        task_specs: tuple[tuple[str, float], ...],
         model: NeuralCellularAutomaton | None = None,
     ):
         config.validate()
-        binary_tasks(task_names, 0)
+        task_names, task_weights = validate_task_specs(task_specs)
         self.config = config
-        self.task_names = tuple(task_names)
+        self.task_specs = tuple(
+            (name, weight) for name, weight in zip(task_names, task_weights)
+        )
+        self.task_names = task_names
+        self.task_weights = task_weights
         self.task_signatures = _task_signatures(config, self.task_names)
         self.device = resolve_device(config.training.device)
         random.seed(config.training.seed)
@@ -271,7 +379,9 @@ class Trainer:
                     "name": "program",
                 }
             )
-        self.optimizer = torch.optim.Adam(groups, lr=config.training.learning_rate)
+        self.optimizer = torch.optim.Adam(
+            groups, lr=learning_rate_at(config.training, 0)
+        )
         self.trial_generator = torch.Generator().manual_seed(config.training.seed)
         self.data_generator = torch.Generator().manual_seed(config.training.seed + 1)
         self.current_update = 0
@@ -298,11 +408,13 @@ class Trainer:
 
     def train_step(self) -> StepMetrics:
         self.model.train()
-        learning_rate = cosine_learning_rate(self.config, self.current_update)
+        learning_rate = learning_rate_at(self.config.training, self.current_update)
         noise = perception_noise(self.config.training, self.current_update)
         for group in self.optimizer.param_groups:
             group["lr"] = learning_rate
-        trials = sample_trials(self.config.training, self.trial_generator)
+        trials = sample_trials(
+            self.config.training, self.task_names, self.trial_generator
+        )
         self.optimizer.zero_grad(set_to_none=True)
         loss_total = semantic_total = raw_total = 0.0
         for trial in trials:
@@ -320,6 +432,7 @@ class Trainer:
                 trial.supervision_steps,
                 task_indices,
                 len(self.task_names),
+                self.task_weights,
             )
             if not torch.isfinite(losses.total):
                 raise FloatingPointError(
@@ -386,21 +499,23 @@ class Trainer:
         )
 
     @torch.no_grad()
-    def validation_loss(self) -> float:
+    def validation_metrics(self) -> ValidationMetrics:
         was_training = self.model.training
         self.model.eval()
-        values = []
+        losses_by_task = {name: [] for name in self.task_names}
+        accuracies_by_task = {name: [] for name in self.task_names}
         devices = [self.device.index or 0] if self.device.type == "cuda" else []
         try:
             with torch.random.fork_rng(devices=devices):
                 torch.manual_seed(self.config.training.seed)
                 if self.device.type == "cuda":
                     torch.cuda.manual_seed_all(self.config.training.seed)
-                for trial in validation_trials(self.config.training):
+                for trial in validation_trials(self.config.training, self.task_names):
                     datasets = self._datasets(trial)
                     layout = TapeLayout(self.config.geometry, trial.tape_slots)
                     for task_index, dataset in enumerate(datasets.datasets):
-                        weighted_loss = 0.0
+                        loss_sum = 0.0
+                        correct = 0
                         for offset in range(
                             0, len(dataset), self.config.training.batch_size_per_task
                         ):
@@ -411,7 +526,7 @@ class Trainer:
                                     len(dataset),
                                 ),
                             )
-                            inputs, targets, _ = (
+                            inputs, targets, lengths = (
                                 value.to(self.device) for value in dataset.take(indices)
                             )
                             task_indices = torch.full(
@@ -434,14 +549,40 @@ class Trainer:
                                 trial.free_steps,
                                 trial.supervision_steps,
                             ).base
-                            weighted_loss += float(loss) * len(indices)
-                        values.append(weighted_loss / len(dataset))
+                            loss_sum += float(loss) * len(indices)
+                            final = quantize(
+                                layout.extract_tape(
+                                    rollout[:, -1, self.config.model.io_channel]
+                                )
+                            )
+                            correct += int(
+                                semantic_correct(
+                                    final,
+                                    targets.to(torch.int8),
+                                    lengths,
+                                    dataset.output_mode,
+                                ).sum()
+                            )
+                        losses_by_task[dataset.name].append(loss_sum / len(dataset))
+                        accuracies_by_task[dataset.name].append(correct / len(dataset))
         finally:
             self.model.train(was_training)
-        result = sum(values) / len(values)
-        if not math.isfinite(result):
+        task_losses = {
+            name: sum(values) / len(values) for name, values in losses_by_task.items()
+        }
+        task_accuracies = {
+            name: sum(values) / len(values)
+            for name, values in accuracies_by_task.items()
+        }
+        result = sum(
+            weight * task_losses[name]
+            for name, weight in zip(self.task_names, self.task_weights)
+        ) / sum(self.task_weights)
+        if not math.isfinite(result) or not all(
+            math.isfinite(value) for value in task_accuracies.values()
+        ):
             raise FloatingPointError("validation produced a non-finite loss")
-        return result
+        return ValidationMetrics(result, task_losses, task_accuracies)
 
     def fit(
         self,
@@ -459,14 +600,25 @@ class Trainer:
                 metrics.update % self.config.training.validation_every == 0
                 or metrics.update == self.config.training.updates
             )
-            validation_loss = self.validation_loss() if should_validate else None
+            validation_metrics = self.validation_metrics() if should_validate else None
+            validation_loss = (
+                None if validation_metrics is None else validation_metrics.loss
+            )
             is_best = (
                 validation_loss is not None
                 and validation_loss < self.best_validation_loss
             )
             if is_best:
                 self.best_validation_loss = validation_loss
-            metrics = replace(metrics, validation_loss=validation_loss)
+            metrics = replace(
+                metrics,
+                validation_loss=validation_loss,
+                validation_accuracies=(
+                    None
+                    if validation_metrics is None
+                    else validation_metrics.task_accuracies
+                ),
+            )
             self.history.append(metrics.to_dict())
             if is_best:
                 self.save(checkpoint_dir / "best.pt")
@@ -482,6 +634,14 @@ class Trainer:
                     f"raw={metrics.raw_accuracy:.2%} lr={metrics.learning_rate:.3g}"
                     f" noise={metrics.perception_noise:.3g}{validation}"
                 )
+                if metrics.validation_accuracies is not None:
+                    print(
+                        "validation accuracy: "
+                        + "  ".join(
+                            f"{name}={accuracy:.2%}"
+                            for name, accuracy in metrics.validation_accuracies.items()
+                        )
+                    )
             if (
                 metrics.update % self.config.training.checkpoint_every == 0
                 or metrics.update == self.config.training.updates
@@ -493,6 +653,7 @@ class Trainer:
         state = {
             "format_version": CHECKPOINT_FORMAT,
             "config": self.config.to_dict(),
+            "task_specs": self.task_specs,
             "task_names": self.task_names,
             "task_signatures": self.task_signatures,
             "model": self.model.state_dict(),
@@ -520,19 +681,19 @@ class Trainer:
     def from_checkpoint(
         cls,
         path: str | Path,
-        task_names: tuple[str, ...] | None = None,
+        task_specs: tuple[tuple[str, float], ...] | None = None,
         device: str | None = None,
     ) -> "Trainer":
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        _validate_checkpoint(checkpoint, task_names)
+        _validate_checkpoint(checkpoint, task_specs)
         config_data = checkpoint["config"]
         if device is not None:
             config_data = {
                 **config_data,
                 "training": {**config_data["training"], "device": device},
             }
-        names = tuple(checkpoint["task_names"])
-        trainer = cls(ExperimentConfig.from_dict(config_data), names)
+        specs = tuple(tuple(spec) for spec in checkpoint["task_specs"])
+        trainer = cls(ExperimentConfig.from_dict(config_data), specs)
         trainer.model.load_state_dict(checkpoint["model"], strict=True)
         trainer.optimizer.load_state_dict(checkpoint["optimizer"])
         trainer.current_update = int(checkpoint["update"])
@@ -547,14 +708,25 @@ class Trainer:
         return trainer
 
 
-def _validate_checkpoint(checkpoint: dict, task_names: tuple[str, ...] | None) -> None:
+def _validate_checkpoint(
+    checkpoint: dict,
+    task_specs: tuple[tuple[str, float], ...] | None,
+) -> None:
     if checkpoint.get("format_version") != CHECKPOINT_FORMAT:
         raise ValueError("checkpoint uses an incompatible model representation")
     stored = tuple(checkpoint.get("task_names", ()))
     if not stored:
         raise ValueError("checkpoint does not define its ordered tasks")
-    if task_names is not None and tuple(task_names) != stored:
-        raise ValueError("checkpoint task order does not match")
+    stored_specs = tuple(tuple(spec) for spec in checkpoint.get("task_specs", ()))
+    stored_names, _ = validate_task_specs(stored_specs)
+    if stored_names != stored:
+        raise ValueError("checkpoint task specs and task order differ")
+    if task_specs is not None:
+        expected_names, expected_weights = validate_task_specs(task_specs)
+        if expected_names != stored or tuple(expected_weights) != tuple(
+            weight for _, weight in stored_specs
+        ):
+            raise ValueError("checkpoint task specs do not match")
     config = ExperimentConfig.from_dict(checkpoint["config"])
     if tuple(checkpoint.get("task_signatures", ())) != _task_signatures(config, stored):
         raise ValueError("checkpoint task definitions do not match")
@@ -578,13 +750,14 @@ def load_model(
 
 def train_seeds(
     config: ExperimentConfig,
-    task_names: tuple[str, ...],
+    task_specs: tuple[tuple[str, float], ...],
     seeds: tuple[int, ...],
     checkpoint_dir: str | Path = "checkpoints",
     *,
     resume: bool = False,
     progress_every: int = 25,
 ) -> list[SeedResult]:
+    task_names, _ = validate_task_specs(task_specs)
     if not seeds or any(type(seed) is not int or seed < 0 for seed in seeds):
         raise ValueError("seeds must contain non-negative integers")
     if len(set(seeds)) != len(seeds):
@@ -605,12 +778,12 @@ def train_seeds(
         latest = seed_dir / "latest.pt"
         if resume and latest.is_file():
             trainer = Trainer.from_checkpoint(
-                latest, task_names, seed_config.training.device
+                latest, task_specs, seed_config.training.device
             )
             if trainer.config != seed_config:
                 raise ValueError(f"seed {seed} checkpoint configuration does not match")
         else:
-            trainer = Trainer(seed_config, task_names)
+            trainer = Trainer(seed_config, task_specs)
         history = trainer.fit(seed_dir, progress_every=progress_every)
         results.append(
             SeedResult(
